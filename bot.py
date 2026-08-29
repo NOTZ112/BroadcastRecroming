@@ -33,10 +33,9 @@ ADMIN_IDS = {
     if x.strip().lstrip("-").isdigit()
 }
 
-# Safe delays
-CHAT_SEND_DELAY = 0.7
-USER_SEND_DELAY = 0.8
-PROGRESS_EVERY = 20
+CHAT_SEND_DELAY = 0.8
+USER_SEND_DELAY = 1.0
+PROGRESS_EVERY = 10
 MAX_RETRIES = 3
 
 WELCOME_TEXT = (
@@ -44,19 +43,8 @@ WELCOME_TEXT = (
     "🎬 പുതിയ വീഡിയോകൾ\n"
     "👥 നല്ല ഗ്രൂപ്പുകൾ\n"
     "📢 പുതിയ ചാനലുകൾ\n\n"
-    "എല്ലാം ഇവിടെ ലഭിക്കും. ❤️"
+    "എല്ലാം ഇവിടെ ലഭിക്കും ❤️"
 )
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-
-log = logging.getLogger("promotion-bot")
 
 # ============================================================
 # DATABASE
@@ -69,25 +57,33 @@ users_col = None
 chats_col = None
 schedules_col = None
 
+
+def now():
+    return datetime.now(timezone.utc)
+
+
 # ============================================================
 # ADMIN
 # ============================================================
 
-
-def is_admin(user_id: int) -> bool:
+def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 
 def admin_only(func):
+
     @wraps(func)
     async def wrapper(update, context):
+
         user = update.effective_user
 
         if not user or not is_admin(user.id):
+
             if update.effective_message:
                 await update.effective_message.reply_text(
                     "⛔ Admin only."
                 )
+
             return
 
         return await func(update, context)
@@ -96,19 +92,11 @@ def admin_only(func):
 
 
 # ============================================================
-# HELPERS
+# PAYLOAD
 # ============================================================
 
-
-def now():
-    return datetime.now(timezone.utc)
-
-
-def clear_setup(context):
-    context.user_data.pop("setup", None)
-
-
 def build_payload(setup):
+
     return {
         "photo_file_id": setup.get("photo_file_id"),
         "text": setup.get("text") or "",
@@ -123,24 +111,22 @@ def build_keyboard(payload):
         payload.get("button_text")
         and payload.get("button_url")
     ):
+
         return InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        payload["button_text"],
-                        url=payload["button_url"],
-                    )
-                ]
-            ]
+            [[
+                InlineKeyboardButton(
+                    payload["button_text"],
+                    url=payload["button_url"]
+                )
+            ]]
         )
 
     return None
 
 
 # ============================================================
-# SEND MESSAGE
+# SEND PAYLOAD
 # ============================================================
-
 
 async def send_payload(bot, chat_id, payload):
 
@@ -155,24 +141,30 @@ async def send_payload(bot, chat_id, payload):
             chat_id=chat_id,
             photo=photo_id,
             caption=text[:1024] if text else None,
-            reply_markup=keyboard,
+            reply_markup=keyboard
         )
 
     return await bot.send_message(
         chat_id=chat_id,
         text=text[:4096],
-        reply_markup=keyboard,
+        reply_markup=keyboard
     )
 
 
 # ============================================================
-# AUTO REGISTER CHAT
+# REGISTER CHAT
 # ============================================================
-
 
 async def register_chat(chat):
 
-    if chat.type not in ("group", "supergroup", "channel"):
+    if not chat:
+        return
+
+    if chat.type not in (
+        "group",
+        "supergroup",
+        "channel"
+    ):
         return
 
     try:
@@ -185,76 +177,37 @@ async def register_chat(chat):
                     "title": chat.title or str(chat.id),
                     "type": chat.type,
                     "enabled": True,
-                    "updated_at": now(),
+                    "updated_at": now()
                 },
                 "$setOnInsert": {
-                    "created_at": now(),
-                },
+                    "created_at": now()
+                }
             },
-            upsert=True,
+            upsert=True
         )
 
         log.info(
-            "AUTO REGISTERED CHAT: %s (%s)",
+            "CHAT REGISTERED: %s | %s",
             chat.title,
-            chat.id,
+            chat.id
         )
 
     except Exception as e:
 
         log.error(
-            "Could not register chat %s: %s",
-            chat.id,
-            e,
+            "Register chat error: %s",
+            e
         )
 
 
 # ============================================================
-# CHAT MEMBER HANDLER
+# MY CHAT MEMBER
+# Bot added / removed from group/channel
 # ============================================================
-
-
-async def chat_member_update(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    chat = update.effective_chat
-
-    if not chat:
-        return
-
-    member_update = update.chat_member
-
-    if not member_update:
-        return
-
-    new_status = member_update.new_chat_member.status
-
-    old_status = member_update.old_chat_member.status
-
-    # Bot has been added/promoted
-    if new_status in (
-        ChatMemberStatus.MEMBER,
-        ChatMemberStatus.ADMINISTRATOR,
-    ):
-
-        if old_status in (
-            ChatMemberStatus.LEFT,
-            ChatMemberStatus.KICKED,
-        ):
-
-            await register_chat(chat)
-
-
-# ============================================================
-# BOT MY CHAT MEMBER HANDLER
-# ============================================================
-
 
 async def my_chat_member_update(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     chat = update.effective_chat
@@ -268,67 +221,79 @@ async def my_chat_member_update(
         return
 
     new_status = member_update.new_chat_member.status
-    old_status = member_update.old_chat_member.status
 
-    # Bot added to group/channel
+    # Bot added or promoted
     if new_status in (
         ChatMemberStatus.MEMBER,
-        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.ADMINISTRATOR
     ):
 
         await register_chat(chat)
 
-        # Send a small confirmation to group where possible
-        try:
+        if chat.type in (
+            "group",
+            "supergroup"
+        ):
 
-            if chat.type in ("group", "supergroup"):
+            try:
 
                 await context.bot.send_message(
                     chat_id=chat.id,
                     text=(
                         "✅ Promotion system activated.\n\n"
-                        "This group is now registered automatically."
-                    ),
+                        "This chat has been registered automatically."
+                    )
                 )
 
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     # Bot removed
     elif new_status in (
         ChatMemberStatus.LEFT,
-        ChatMemberStatus.KICKED,
+        "kicked"
     ):
 
-        try:
+        await chats_col.update_one(
+            {"chat_id": chat.id},
+            {
+                "$set": {
+                    "enabled": False,
+                    "updated_at": now()
+                }
+            }
+        )
 
-            await chats_col.update_one(
-                {"chat_id": chat.id},
-                {
-                    "$set": {
-                        "enabled": False,
-                        "updated_at": now(),
-                    }
-                },
-            )
+        log.info(
+            "BOT REMOVED: %s",
+            chat.id
+        )
 
-            log.info(
-                "BOT REMOVED FROM CHAT: %s",
-                chat.id,
-            )
 
-        except Exception:
-            pass
+# ============================================================
+# CHAT MEMBER
+# ============================================================
+
+async def chat_member_update(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat = update.effective_chat
+
+    if not chat:
+        return
+
+    await register_chat(chat)
 
 
 # ============================================================
 # START
 # ============================================================
 
-
 async def start(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     user = update.effective_user
@@ -349,12 +314,12 @@ async def start(
                     "name": user.full_name,
                     "username": user.username,
                     "last_seen_at": now(),
-                    "blocked": False,
+                    "blocked": False
                 }
-            },
+            }
         )
 
-        # No repeated message
+        # Don't send welcome again
         return
 
     await users_col.insert_one(
@@ -364,8 +329,7 @@ async def start(
             "username": user.username,
             "first_started_at": now(),
             "last_seen_at": now(),
-            "welcome_sent": True,
-            "blocked": False,
+            "blocked": False
         }
     )
 
@@ -378,11 +342,10 @@ async def start(
 # USERS
 # ============================================================
 
-
 @admin_only
 async def users(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    update,
+    context
 ):
 
     total = await users_col.count_documents({})
@@ -407,38 +370,43 @@ async def users(
 # CHATS
 # ============================================================
 
-
 @admin_only
 async def chats(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    update,
+    context
 ):
 
-    rows = await chats_col.find(
+    total = await chats_col.count_documents({})
+
+    active = await chats_col.count_documents(
         {"enabled": True}
-    ).to_list(length=1000)
+    )
 
-    if not rows:
+    groups = await chats_col.count_documents(
+        {
+            "enabled": True,
+            "type": {
+                "$in": [
+                    "group",
+                    "supergroup"
+                ]
+            }
+        }
+    )
 
-        await update.effective_message.reply_text(
-            "❌ No groups/channels registered yet."
-        )
-        return
-
-    lines = [
-        "📢 REGISTERED GROUPS / CHANNELS\n"
-    ]
-
-    for row in rows:
-
-        lines.append(
-            f"• {row.get('title', '-')}\n"
-            f"  ID: {row['chat_id']}\n"
-            f"  Type: {row.get('type', '-')}\n"
-        )
+    channels = await chats_col.count_documents(
+        {
+            "enabled": True,
+            "type": "channel"
+        }
+    )
 
     await update.effective_message.reply_text(
-        "\n".join(lines)
+        "📊 CHAT STATISTICS\n\n"
+        f"👥 Groups: {groups}\n"
+        f"📢 Channels: {channels}\n"
+        f"📦 Total Active: {active}\n"
+        f"🗃️ Total Records: {total}"
     )
 
 
@@ -446,67 +414,61 @@ async def chats(
 # HELP
 # ============================================================
 
-
 @admin_only
 async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    update,
+    context
 ):
 
     await update.effective_message.reply_text(
         "🔥 PROMOTION BOT\n\n"
 
-        "👥 Users\n"
+        "👥 USER\n"
         "/users\n"
         "/ubroadcast\n\n"
 
-        "📢 Promotion\n"
+        "📢 BROADCAST\n"
         "/broadcast\n\n"
 
-        "🔄 Auto Schedule\n"
+        "🔄 SCHEDULE\n"
         "/schedule\n"
         "/schedules\n"
         "/pause ID\n"
         "/resume ID\n"
         "/delete_schedule ID\n\n"
 
-        "📋 Chats\n"
+        "📊 CHATS\n"
         "/chats\n\n"
 
         "❌ /cancel\n\n"
 
-        "ℹ️ No /addchat required.\n"
-        "When the bot is added to a group/channel, "
-        "it is automatically registered."
+        "ℹ️ /addchat is NOT required.\n"
+        "New groups/channels are registered automatically."
     )
 
 
 # ============================================================
-# START SETUP
+# SETUP START
 # ============================================================
-
 
 async def begin_setup(
     update,
     context,
-    mode,
+    mode
 ):
-
-    clear_setup(context)
 
     context.user_data["setup"] = {
         "mode": mode,
         "step": "content",
         "photo_file_id": None,
-        "text": None,
+        "text": "",
         "button_text": None,
-        "button_url": None,
-        "interval": None,
+        "button_url": None
     }
 
     await update.effective_message.reply_text(
         f"🚀 {mode.upper()} SETUP\n\n"
-        "🖼️ Send photo with caption\n"
+        "🖼️ Send a photo with caption\n"
         "OR\n"
         "📝 Send text\n\n"
         "Then button setup will appear.\n\n"
@@ -518,17 +480,16 @@ async def begin_setup(
 # BROADCAST
 # ============================================================
 
-
 @admin_only
 async def broadcast(
     update,
-    context,
+    context
 ):
 
     await begin_setup(
         update,
         context,
-        "broadcast",
+        "broadcast"
     )
 
 
@@ -536,17 +497,16 @@ async def broadcast(
 # USER BROADCAST
 # ============================================================
 
-
 @admin_only
 async def ubroadcast(
     update,
-    context,
+    context
 ):
 
     await begin_setup(
         update,
         context,
-        "ubroadcast",
+        "ubroadcast"
     )
 
 
@@ -554,17 +514,16 @@ async def ubroadcast(
 # SCHEDULE
 # ============================================================
 
-
 @admin_only
 async def schedule(
     update,
-    context,
+    context
 ):
 
     await begin_setup(
         update,
         context,
-        "schedule",
+        "schedule"
     )
 
 
@@ -572,10 +531,9 @@ async def schedule(
 # CAPTURE CONTENT
 # ============================================================
 
-
 async def capture_content(
     update,
-    context,
+    context
 ):
 
     setup = context.user_data.get("setup")
@@ -600,14 +558,10 @@ async def capture_content(
 
     elif message.text:
 
-        if message.text.startswith("/"):
-            return
-
         setup["photo_file_id"] = None
         setup["text"] = message.text
 
     else:
-
         return
 
     setup["step"] = "button"
@@ -616,19 +570,18 @@ async def capture_content(
         "🔘 BUTTON\n\n"
         "Send:\n\n"
         "Button Text | https://example.com\n\n"
-        "OR send:\n"
+        "OR\n"
         "skip"
     )
 
 
 # ============================================================
-# BUTTON
+# CAPTURE BUTTON
 # ============================================================
-
 
 async def capture_button(
     update,
-    context,
+    context
 ):
 
     setup = context.user_data.get("setup")
@@ -653,9 +606,10 @@ async def capture_button(
         if "|" not in text:
 
             await update.effective_message.reply_text(
-                "❌ Use:\n"
+                "❌ Correct format:\n\n"
                 "Button Text | https://example.com"
             )
+
             return
 
         button_text, button_url = (
@@ -672,38 +626,40 @@ async def capture_button(
             await update.effective_message.reply_text(
                 "❌ Invalid URL."
             )
+
             return
 
         setup["button_text"] = button_text[:64]
         setup["button_url"] = button_url
 
-    # Broadcast
+    # BROADCAST
     if setup["mode"] == "broadcast":
 
         await execute_chat_broadcast(
             update,
-            context,
+            context
         )
 
         return
 
-    # User broadcast
+    # USER BROADCAST
     if setup["mode"] == "ubroadcast":
 
         await execute_user_broadcast(
             update,
-            context,
+            context
         )
 
         return
 
-    # Schedule
+    # SCHEDULE
     if setup["mode"] == "schedule":
 
         setup["step"] = "interval"
 
         await update.effective_message.reply_text(
-            "⏱️ SEND SCHEDULE INTERVAL\n\n"
+            "⏱️ SELECT INTERVAL\n\n"
+            "5m\n"
             "10m\n"
             "15m\n"
             "30m\n"
@@ -715,10 +671,9 @@ async def capture_button(
 # CHAT BROADCAST
 # ============================================================
 
-
 async def execute_chat_broadcast(
     update,
-    context,
+    context
 ):
 
     setup = context.user_data.get("setup")
@@ -727,25 +682,28 @@ async def execute_chat_broadcast(
 
     rows = await chats_col.find(
         {"enabled": True}
-    ).to_list(length=1000)
+    ).to_list(length=5000)
 
     total = len(rows)
 
     if total == 0:
 
-        clear_setup(context)
+        context.user_data.pop(
+            "setup",
+            None
+        )
 
         await update.effective_message.reply_text(
             "❌ No registered groups/channels."
         )
+
         return
 
     progress = await update.effective_message.reply_text(
         "📢 BROADCAST STARTING...\n\n"
         f"📦 Total: {total}\n"
         "✅ Sent: 0\n"
-        "⏳ Remaining: "
-        f"{total}\n"
+        f"⏳ Remaining: {total}\n"
         "❌ Failed: 0\n"
         "📊 Progress: 0%"
     )
@@ -755,7 +713,7 @@ async def execute_chat_broadcast(
 
     for index, row in enumerate(
         rows,
-        start=1,
+        start=1
     ):
 
         chat_id = row["chat_id"]
@@ -765,23 +723,20 @@ async def execute_chat_broadcast(
             await send_payload(
                 context.bot,
                 chat_id,
-                payload,
+                payload
             )
 
             sent += 1
 
         except RetryAfter as e:
 
-            wait = (
-                int(
-                    getattr(
-                        e,
-                        "retry_after",
-                        1,
-                    )
+            wait = int(
+                getattr(
+                    e,
+                    "retry_after",
+                    1
                 )
-                + 2
-            )
+            ) + 2
 
             await asyncio.sleep(wait)
 
@@ -790,12 +745,13 @@ async def execute_chat_broadcast(
                 await send_payload(
                     context.bot,
                     chat_id,
-                    payload,
+                    payload
                 )
 
                 sent += 1
 
             except Exception:
+
                 failed += 1
 
         except Exception as e:
@@ -805,7 +761,7 @@ async def execute_chat_broadcast(
             log.warning(
                 "Broadcast failed %s: %s",
                 chat_id,
-                e,
+                e
             )
 
         await asyncio.sleep(
@@ -821,7 +777,7 @@ async def execute_chat_broadcast(
 
             percent = round(
                 index / total * 100,
-                1,
+                1
             )
 
             try:
@@ -838,7 +794,10 @@ async def execute_chat_broadcast(
             except Exception:
                 pass
 
-    clear_setup(context)
+    context.user_data.pop(
+        "setup",
+        None
+    )
 
     await progress.edit_text(
         "✅ BROADCAST COMPLETED\n\n"
@@ -852,39 +811,40 @@ async def execute_chat_broadcast(
 # USER BROADCAST
 # ============================================================
 
-
 async def safe_user_send(
     bot,
     user_id,
-    payload,
+    payload
 ):
 
-    for attempt in range(MAX_RETRIES + 1):
+    for attempt in range(
+        MAX_RETRIES + 1
+    ):
 
         try:
 
             return await send_payload(
                 bot,
                 user_id,
-                payload,
+                payload
             )
 
         except RetryAfter as e:
 
-            wait = (
-                int(
-                    getattr(
-                        e,
-                        "retry_after",
-                        1,
-                    )
+            wait = int(
+                getattr(
+                    e,
+                    "retry_after",
+                    1
                 )
-                + 2
-            )
+            ) + 2
 
             await asyncio.sleep(wait)
 
-        except (TimedOut, NetworkError):
+        except (
+            TimedOut,
+            NetworkError
+        ):
 
             if attempt >= MAX_RETRIES:
                 raise
@@ -900,7 +860,7 @@ async def safe_user_send(
 
 async def execute_user_broadcast(
     update,
-    context,
+    context
 ):
 
     setup = context.user_data.get("setup")
@@ -908,16 +868,24 @@ async def execute_user_broadcast(
     payload = build_payload(setup)
 
     total = await users_col.count_documents(
-        {"blocked": {"$ne": True}}
+        {
+            "blocked": {
+                "$ne": True
+            }
+        }
     )
 
     if total == 0:
 
-        clear_setup(context)
+        context.user_data.pop(
+            "setup",
+            None
+        )
 
         await update.effective_message.reply_text(
             "❌ No users."
         )
+
         return
 
     progress = await update.effective_message.reply_text(
@@ -934,11 +902,17 @@ async def execute_user_broadcast(
     processed = 0
 
     cursor = users_col.find(
-        {"blocked": {"$ne": True}},
-        {"user_id": 1},
+        {
+            "blocked": {
+                "$ne": True
+            }
+        },
+        {
+            "user_id": 1
+        }
     ).sort(
         "_id",
-        1,
+        1
     )
 
     async for row in cursor:
@@ -952,7 +926,7 @@ async def execute_user_broadcast(
             await safe_user_send(
                 context.bot,
                 user_id,
-                payload,
+                payload
             )
 
             sent += 1
@@ -974,9 +948,9 @@ async def execute_user_broadcast(
                     {
                         "$set": {
                             "blocked": True,
-                            "blocked_at": now(),
+                            "blocked_at": now()
                         }
-                    },
+                    }
                 )
 
         processed += 1
@@ -992,12 +966,12 @@ async def execute_user_broadcast(
 
             remaining = max(
                 total - processed,
-                0,
+                0
             )
 
             percent = round(
                 processed / total * 100,
-                1,
+                1
             )
 
             try:
@@ -1014,7 +988,10 @@ async def execute_user_broadcast(
             except Exception:
                 pass
 
-    clear_setup(context)
+    context.user_data.pop(
+        "setup",
+        None
+    )
 
     await progress.edit_text(
         "✅ USER BROADCAST COMPLETED\n\n"
@@ -1025,21 +1002,25 @@ async def execute_user_broadcast(
 
 
 # ============================================================
-# SCHEDULE INTERVAL
+# INTERVALS
 # ============================================================
 
-
 INTERVALS = {
+    "5m": 300,
     "10m": 600,
     "15m": 900,
     "30m": 1800,
-    "1h": 3600,
+    "1h": 3600
 }
 
 
+# ============================================================
+# CREATE SCHEDULE
+# ============================================================
+
 async def capture_interval(
     update,
-    context,
+    context
 ):
 
     setup = context.user_data.get("setup")
@@ -1057,13 +1038,14 @@ async def capture_interval(
     if value not in INTERVALS:
 
         await update.effective_message.reply_text(
-            "❌ Invalid.\n\n"
-            "Use:\n"
+            "❌ Invalid interval.\n\n"
+            "5m\n"
             "10m\n"
             "15m\n"
             "30m\n"
             "1h"
         )
+
         return
 
     payload = build_payload(setup)
@@ -1075,7 +1057,7 @@ async def capture_interval(
         "enabled": True,
         "last_messages": {},
         "created_at": now(),
-        "updated_at": now(),
+        "updated_at": now()
     }
 
     result = await schedules_col.insert_one(
@@ -1086,10 +1068,10 @@ async def capture_interval(
         result.inserted_id
     )
 
-    # Immediate first send
+    # First message immediately
     await run_schedule(
         schedule_id,
-        context.application,
+        context.application
     )
 
     context.application.job_queue.run_repeating(
@@ -1099,31 +1081,33 @@ async def capture_interval(
         data={
             "schedule_id": schedule_id
         },
-        name=f"schedule:{schedule_id}",
+        name=f"schedule:{schedule_id}"
     )
 
-    clear_setup(context)
+    context.user_data.pop(
+        "setup",
+        None
+    )
 
     await update.effective_message.reply_text(
         "✅ SCHEDULE CREATED\n\n"
         f"🆔 {schedule_id}\n"
-        f"⏱ Every {value}\n"
-        "🔄 Old message → DELETE\n"
-        "📸 New message → SEND\n\n"
-        "It will automatically work in "
-        "all registered groups/channels."
+        f"⏱ Every {value}\n\n"
+        "🔄 Old scheduled message will be deleted.\n"
+        "🆕 New promotion will be sent.\n\n"
+        "It works automatically for all "
+        "registered groups/channels."
     )
 
 
 # ============================================================
-# RUN SCHEDULE
+# DELETE OLD MESSAGE
 # ============================================================
-
 
 async def delete_message_safe(
     bot,
     chat_id,
-    message_id,
+    message_id
 ):
 
     if not message_id:
@@ -1133,21 +1117,18 @@ async def delete_message_safe(
 
         await bot.delete_message(
             chat_id=chat_id,
-            message_id=message_id,
+            message_id=message_id
         )
 
     except RetryAfter as e:
 
-        wait = (
-            int(
-                getattr(
-                    e,
-                    "retry_after",
-                    1,
-                )
+        wait = int(
+            getattr(
+                e,
+                "retry_after",
+                1
             )
-            + 2
-        )
+        ) + 2
 
         await asyncio.sleep(wait)
 
@@ -1155,7 +1136,7 @@ async def delete_message_safe(
 
             await bot.delete_message(
                 chat_id=chat_id,
-                message_id=message_id,
+                message_id=message_id
             )
 
         except Exception:
@@ -1165,9 +1146,13 @@ async def delete_message_safe(
         pass
 
 
+# ============================================================
+# RUN SCHEDULE
+# ============================================================
+
 async def run_schedule(
     schedule_id,
-    application,
+    application
 ):
 
     try:
@@ -1182,7 +1167,7 @@ async def run_schedule(
     doc = await schedules_col.find_one(
         {
             "_id": object_id,
-            "enabled": True,
+            "enabled": True
         }
     )
 
@@ -1193,11 +1178,11 @@ async def run_schedule(
 
     rows = await chats_col.find(
         {"enabled": True}
-    ).to_list(length=1000)
+    ).to_list(length=5000)
 
     old_messages = doc.get(
         "last_messages",
-        {},
+        {}
     )
 
     new_messages = {}
@@ -1207,11 +1192,11 @@ async def run_schedule(
         chat_id = row["chat_id"]
         key = str(chat_id)
 
-        # Delete previous scheduled message
+        # Delete previous scheduled promotion
         await delete_message_safe(
             application.bot,
             chat_id,
-            old_messages.get(key),
+            old_messages.get(key)
         )
 
         try:
@@ -1219,7 +1204,7 @@ async def run_schedule(
             message = await send_payload(
                 application.bot,
                 chat_id,
-                payload,
+                payload
             )
 
             new_messages[key] = (
@@ -1228,16 +1213,13 @@ async def run_schedule(
 
         except RetryAfter as e:
 
-            wait = (
-                int(
-                    getattr(
-                        e,
-                        "retry_after",
-                        1,
-                    )
+            wait = int(
+                getattr(
+                    e,
+                    "retry_after",
+                    1
                 )
-                + 2
-            )
+            ) + 2
 
             await asyncio.sleep(wait)
 
@@ -1246,7 +1228,7 @@ async def run_schedule(
                 message = await send_payload(
                     application.bot,
                     chat_id,
-                    payload,
+                    payload
                 )
 
                 new_messages[key] = (
@@ -1258,7 +1240,7 @@ async def run_schedule(
                 log.warning(
                     "Schedule retry failed %s: %s",
                     chat_id,
-                    retry_error,
+                    retry_error
                 )
 
         except Exception as e:
@@ -1266,7 +1248,7 @@ async def run_schedule(
             log.warning(
                 "Schedule failed %s: %s",
                 chat_id,
-                e,
+                e
             )
 
         await asyncio.sleep(
@@ -1278,9 +1260,9 @@ async def run_schedule(
         {
             "$set": {
                 "last_messages": new_messages,
-                "updated_at": now(),
+                "updated_at": now()
             }
-        },
+        }
     )
 
 
@@ -1288,9 +1270,8 @@ async def run_schedule(
 # SCHEDULE JOB
 # ============================================================
 
-
 async def scheduled_job(
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     schedule_id = (
@@ -1299,17 +1280,16 @@ async def scheduled_job(
 
     await run_schedule(
         schedule_id,
-        context.application,
+        context.application
     )
 
 
 # ============================================================
-# RESTORE SCHEDULES AFTER RENDER RESTART
+# RESTORE SCHEDULES
 # ============================================================
 
-
 async def restore_schedules(
-    application,
+    application
 ):
 
     rows = await schedules_col.find(
@@ -1322,47 +1302,49 @@ async def restore_schedules(
             row["_id"]
         )
 
-        interval = int(
-            row["interval"]
-        )
-
-        # Prevent duplicate jobs
-        for job in application.job_queue.get_jobs_by_name(
-            f"schedule:{schedule_id}"
+        for job in (
+            application
+            .job_queue
+            .get_jobs_by_name(
+                f"schedule:{schedule_id}"
+            )
         ):
 
             job.schedule_removal()
 
         application.job_queue.run_repeating(
             scheduled_job,
-            interval=interval,
-            first=interval,
+            interval=int(
+                row["interval"]
+            ),
+            first=int(
+                row["interval"]
+            ),
             data={
                 "schedule_id": schedule_id
             },
-            name=f"schedule:{schedule_id}",
+            name=f"schedule:{schedule_id}"
         )
 
     log.info(
         "Restored %d schedules",
-        len(rows),
+        len(rows)
     )
 
 
 # ============================================================
-# LIST SCHEDULES
+# SCHEDULE LIST
 # ============================================================
-
 
 @admin_only
 async def schedules(
     update,
-    context,
+    context
 ):
 
     rows = await schedules_col.find().sort(
         "created_at",
-        -1,
+        -1
     ).to_list(length=100)
 
     if not rows:
@@ -1370,6 +1352,7 @@ async def schedules(
         await update.effective_message.reply_text(
             "❌ No schedules."
         )
+
         return
 
     lines = [
@@ -1403,11 +1386,10 @@ async def schedules(
 # PAUSE
 # ============================================================
 
-
 @admin_only
 async def pause(
     update,
-    context,
+    context
 ):
 
     if not context.args:
@@ -1415,6 +1397,7 @@ async def pause(
         await update.effective_message.reply_text(
             "/pause <schedule_id>"
         )
+
         return
 
     sid = context.args[0]
@@ -1428,6 +1411,7 @@ async def pause(
         await update.effective_message.reply_text(
             "❌ Invalid ID."
         )
+
         return
 
     result = await schedules_col.update_one(
@@ -1435,13 +1419,17 @@ async def pause(
         {
             "$set": {
                 "enabled": False,
-                "updated_at": now(),
+                "updated_at": now()
             }
-        },
+        }
     )
 
-    for job in context.application.job_queue.get_jobs_by_name(
-        f"schedule:{sid}"
+    for job in (
+        context.application
+        .job_queue
+        .get_jobs_by_name(
+            f"schedule:{sid}"
+        )
     ):
 
         job.schedule_removal()
@@ -1463,11 +1451,10 @@ async def pause(
 # RESUME
 # ============================================================
 
-
 @admin_only
 async def resume(
     update,
-    context,
+    context
 ):
 
     if not context.args:
@@ -1475,6 +1462,7 @@ async def resume(
         await update.effective_message.reply_text(
             "/resume <schedule_id>"
         )
+
         return
 
     sid = context.args[0]
@@ -1488,6 +1476,7 @@ async def resume(
         await update.effective_message.reply_text(
             "❌ Invalid ID."
         )
+
         return
 
     row = await schedules_col.find_one(
@@ -1499,6 +1488,7 @@ async def resume(
         await update.effective_message.reply_text(
             "❌ Schedule not found."
         )
+
         return
 
     await schedules_col.update_one(
@@ -1506,13 +1496,17 @@ async def resume(
         {
             "$set": {
                 "enabled": True,
-                "updated_at": now(),
+                "updated_at": now()
             }
-        },
+        }
     )
 
-    for job in context.application.job_queue.get_jobs_by_name(
-        f"schedule:{sid}"
+    for job in (
+        context.application
+        .job_queue
+        .get_jobs_by_name(
+            f"schedule:{sid}"
+        )
     ):
 
         job.schedule_removal()
@@ -1524,7 +1518,7 @@ async def resume(
         data={
             "schedule_id": sid
         },
-        name=f"schedule:{sid}",
+        name=f"schedule:{sid}"
     )
 
     await update.effective_message.reply_text(
@@ -1536,11 +1530,10 @@ async def resume(
 # DELETE SCHEDULE
 # ============================================================
 
-
 @admin_only
 async def delete_schedule(
     update,
-    context,
+    context
 ):
 
     if not context.args:
@@ -1548,6 +1541,7 @@ async def delete_schedule(
         await update.effective_message.reply_text(
             "/delete_schedule <schedule_id>"
         )
+
         return
 
     sid = context.args[0]
@@ -1561,6 +1555,7 @@ async def delete_schedule(
         await update.effective_message.reply_text(
             "❌ Invalid ID."
         )
+
         return
 
     row = await schedules_col.find_one(
@@ -1572,26 +1567,30 @@ async def delete_schedule(
         await update.effective_message.reply_text(
             "❌ Schedule not found."
         )
+
         return
 
-    # Delete last scheduled messages
     for chat_id, message_id in row.get(
         "last_messages",
-        {},
+        {}
     ).items():
 
         await delete_message_safe(
             context.bot,
             int(chat_id),
-            int(message_id),
+            int(message_id)
         )
 
     await schedules_col.delete_one(
         {"_id": object_id}
     )
 
-    for job in context.application.job_queue.get_jobs_by_name(
-        f"schedule:{sid}"
+    for job in (
+        context.application
+        .job_queue
+        .get_jobs_by_name(
+            f"schedule:{sid}"
+        )
     ):
 
         job.schedule_removal()
@@ -1605,14 +1604,16 @@ async def delete_schedule(
 # CANCEL
 # ============================================================
 
-
 @admin_only
 async def cancel(
     update,
-    context,
+    context
 ):
 
-    clear_setup(context)
+    context.user_data.pop(
+        "setup",
+        None
+    )
 
     await update.effective_message.reply_text(
         "❌ Cancelled."
@@ -1620,13 +1621,12 @@ async def cancel(
 
 
 # ============================================================
-# SETUP MESSAGE ROUTER
+# SETUP ROUTER
 # ============================================================
-
 
 async def setup_router(
     update,
-    context,
+    context
 ):
 
     setup = context.user_data.get("setup")
@@ -1640,37 +1640,39 @@ async def setup_router(
 
         await capture_content(
             update,
-            context,
+            context
         )
 
     elif step == "button":
 
         await capture_button(
             update,
-            context,
+            context
         )
 
     elif step == "interval":
 
         await capture_interval(
             update,
-            context,
+            context
         )
 
 
 # ============================================================
-# ERROR
+# ERROR HANDLER
 # ============================================================
-
 
 async def error_handler(
     update,
-    context,
+    context
 ):
 
-    log.exception(
-        "Unhandled error:",
-        exc_info=context.error,
+    error = context.error
+
+    log.error(
+        "Unhandled error: %s",
+        error,
+        exc_info=True
     )
 
 
@@ -1678,9 +1680,8 @@ async def error_handler(
 # POST INIT
 # ============================================================
 
-
 async def post_init(
-    application,
+    application
 ):
 
     global mongo
@@ -1707,12 +1708,12 @@ async def post_init(
 
     await users_col.create_index(
         "user_id",
-        unique=True,
+        unique=True
     )
 
     await chats_col.create_index(
         "chat_id",
-        unique=True,
+        unique=True
     )
 
     await schedules_col.create_index(
@@ -1732,9 +1733,8 @@ async def post_init(
 # POST SHUTDOWN
 # ============================================================
 
-
 async def post_shutdown(
-    application,
+    application
 ):
 
     global mongo
@@ -1751,7 +1751,6 @@ async def post_shutdown(
 # ============================================================
 # MAIN
 # ============================================================
-
 
 def main():
 
@@ -1775,85 +1774,115 @@ def main():
         .build()
     )
 
-    # ========================================================
-    # COMMANDS
-    # ========================================================
-
+    # Commands
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     application.add_handler(
-        CommandHandler("help", help_command)
+        CommandHandler(
+            "help",
+            help_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("users", users)
+        CommandHandler(
+            "users",
+            users
+        )
     )
 
     application.add_handler(
-        CommandHandler("broadcast", broadcast)
+        CommandHandler(
+            "chats",
+            chats
+        )
     )
 
     application.add_handler(
-        CommandHandler("ubroadcast", ubroadcast)
+        CommandHandler(
+            "broadcast",
+            broadcast
+        )
     )
 
     application.add_handler(
-        CommandHandler("schedule", schedule)
+        CommandHandler(
+            "ubroadcast",
+            ubroadcast
+        )
     )
 
     application.add_handler(
-        CommandHandler("schedules", schedules)
+        CommandHandler(
+            "schedule",
+            schedule
+        )
     )
 
     application.add_handler(
-        CommandHandler("pause", pause)
+        CommandHandler(
+            "schedules",
+            schedules
+        )
     )
 
     application.add_handler(
-        CommandHandler("resume", resume)
+        CommandHandler(
+            "pause",
+            pause
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "resume",
+            resume
+        )
     )
 
     application.add_handler(
         CommandHandler(
             "delete_schedule",
-            delete_schedule,
+            delete_schedule
         )
     )
 
     application.add_handler(
-        CommandHandler("cancel", cancel)
+        CommandHandler(
+            "cancel",
+            cancel
+        )
     )
 
-    # ========================================================
-    # AUTOMATIC CHAT DETECTION
-    # ========================================================
+    # Automatic chat registration
+    application.add_handler(
+        ChatMemberHandler(
+            my_chat_member_update,
+            ChatMemberHandler.MY_CHAT_MEMBER
+        )
+    )
 
     application.add_handler(
         ChatMemberHandler(
             chat_member_update,
-            ChatMemberHandler.CHAT_MEMBER,
+            ChatMemberHandler.CHAT_MEMBER
         )
     )
 
-    application.add_handler(
-        ChatMemberHandler(
-            my_chat_member_update,
-            ChatMemberHandler.MY_CHAT_MEMBER,
-        )
-    )
-
-    # ========================================================
-    # SETUP CONTENT
-    # ========================================================
-
+    # Content setup
     application.add_handler(
         MessageHandler(
-            filters.PHOTO | (
-                filters.TEXT & ~filters.COMMAND
+            filters.PHOTO
+            | (
+                filters.TEXT
+                & ~filters.COMMAND
             ),
-            setup_router,
+            setup_router
         )
     )
 
@@ -1862,18 +1891,14 @@ def main():
     )
 
     log.info(
-        "Starting bot..."
+        "Starting promotion bot..."
     )
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=False,
+        drop_pending_updates=False
     )
 
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
     main()
