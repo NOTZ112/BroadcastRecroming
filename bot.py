@@ -4,15 +4,17 @@ import logging
 from datetime import datetime, timezone
 from functools import wraps
 
-from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatMemberStatus
 from telegram.error import RetryAfter, TimedOut, NetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters,
 )
@@ -23,7 +25,7 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MONGO_URI = os.getenv("MONGO_URI", "")
-DB_NAME = os.getenv("DB_NAME", "broadcast_scheduler")
+DB_NAME = os.getenv("DB_NAME", "promotion_bot")
 
 ADMIN_IDS = {
     int(x.strip())
@@ -31,12 +33,12 @@ ADMIN_IDS = {
     if x.strip().lstrip("-").isdigit()
 }
 
-# User broadcast safety
-USER_SEND_DELAY = float(os.getenv("USER_SEND_DELAY", "0.8"))
-PROGRESS_EVERY = int(os.getenv("PROGRESS_EVERY", "20"))
-MAX_SEND_RETRIES = 3
+# Safe delays
+CHAT_SEND_DELAY = 0.7
+USER_SEND_DELAY = 0.8
+PROGRESS_EVERY = 20
+MAX_RETRIES = 3
 
-# One-time welcome message
 WELCOME_TEXT = (
     "👋 Welcome!\n\n"
     "🎬 പുതിയ വീഡിയോകൾ\n"
@@ -54,7 +56,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-log = logging.getLogger("broadcast_scheduler")
+log = logging.getLogger("promotion-bot")
 
 # ============================================================
 # DATABASE
@@ -62,14 +64,15 @@ log = logging.getLogger("broadcast_scheduler")
 
 mongo = None
 db = None
+
 users_col = None
 chats_col = None
 schedules_col = None
 
+# ============================================================
+# ADMIN
+# ============================================================
 
-# ============================================================
-# ADMIN CHECK
-# ============================================================
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -77,7 +80,7 @@ def is_admin(user_id: int) -> bool:
 
 def admin_only(func):
     @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def wrapper(update, context):
         user = update.effective_user
 
         if not user or not is_admin(user.id):
@@ -93,131 +96,240 @@ def admin_only(func):
 
 
 # ============================================================
-# GENERAL HELPERS
+# HELPERS
 # ============================================================
 
-def reset_setup(context):
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def clear_setup(context):
     context.user_data.pop("setup", None)
 
 
-async def get_registered_chats():
-    return await chats_col.find(
-        {"enabled": True}
-    ).to_list(length=1000)
+def build_payload(setup):
+    return {
+        "photo_file_id": setup.get("photo_file_id"),
+        "text": setup.get("text") or "",
+        "button_text": setup.get("button_text"),
+        "button_url": setup.get("button_url"),
+    }
 
 
-# ============================================================
-# BUTTON + MESSAGE SENDING
-# ============================================================
+def build_keyboard(payload):
 
-async def send_payload(bot, chat_id, payload):
-
-    keyboard = None
-
-    button_text = payload.get("button_text")
-    button_url = payload.get("button_url")
-
-    if button_text and button_url:
-        keyboard = InlineKeyboardMarkup(
+    if (
+        payload.get("button_text")
+        and payload.get("button_url")
+    ):
+        return InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
-                        button_text,
-                        url=button_url
+                        payload["button_text"],
+                        url=payload["button_url"],
                     )
                 ]
             ]
         )
 
-    photo_file_id = payload.get("photo_file_id")
+    return None
+
+
+# ============================================================
+# SEND MESSAGE
+# ============================================================
+
+
+async def send_payload(bot, chat_id, payload):
+
+    keyboard = build_keyboard(payload)
+
+    photo_id = payload.get("photo_file_id")
     text = payload.get("text") or ""
 
-    # PHOTO
-    if photo_file_id:
+    if photo_id:
 
         return await bot.send_photo(
             chat_id=chat_id,
-            photo=photo_file_id,
+            photo=photo_id,
             caption=text[:1024] if text else None,
-            reply_markup=keyboard
+            reply_markup=keyboard,
         )
 
-    # TEXT
-    else:
+    return await bot.send_message(
+        chat_id=chat_id,
+        text=text[:4096],
+        reply_markup=keyboard,
+    )
 
-        return await bot.send_message(
-            chat_id=chat_id,
-            text=text[:4096],
-            reply_markup=keyboard
+
+# ============================================================
+# AUTO REGISTER CHAT
+# ============================================================
+
+
+async def register_chat(chat):
+
+    if chat.type not in ("group", "supergroup", "channel"):
+        return
+
+    try:
+
+        await chats_col.update_one(
+            {"chat_id": chat.id},
+            {
+                "$set": {
+                    "chat_id": chat.id,
+                    "title": chat.title or str(chat.id),
+                    "type": chat.type,
+                    "enabled": True,
+                    "updated_at": now(),
+                },
+                "$setOnInsert": {
+                    "created_at": now(),
+                },
+            },
+            upsert=True,
+        )
+
+        log.info(
+            "AUTO REGISTERED CHAT: %s (%s)",
+            chat.title,
+            chat.id,
+        )
+
+    except Exception as e:
+
+        log.error(
+            "Could not register chat %s: %s",
+            chat.id,
+            e,
         )
 
 
 # ============================================================
-# SAFE USER SEND
+# CHAT MEMBER HANDLER
 # ============================================================
 
-async def safe_send_user(bot, user_id, payload):
 
-    last_error = None
+async def chat_member_update(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-    for attempt in range(MAX_SEND_RETRIES + 1):
+    chat = update.effective_chat
+
+    if not chat:
+        return
+
+    member_update = update.chat_member
+
+    if not member_update:
+        return
+
+    new_status = member_update.new_chat_member.status
+
+    old_status = member_update.old_chat_member.status
+
+    # Bot has been added/promoted
+    if new_status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+    ):
+
+        if old_status in (
+            ChatMemberStatus.LEFT,
+            ChatMemberStatus.KICKED,
+        ):
+
+            await register_chat(chat)
+
+
+# ============================================================
+# BOT MY CHAT MEMBER HANDLER
+# ============================================================
+
+
+async def my_chat_member_update(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    chat = update.effective_chat
+
+    if not chat:
+        return
+
+    member_update = update.my_chat_member
+
+    if not member_update:
+        return
+
+    new_status = member_update.new_chat_member.status
+    old_status = member_update.old_chat_member.status
+
+    # Bot added to group/channel
+    if new_status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+    ):
+
+        await register_chat(chat)
+
+        # Send a small confirmation to group where possible
+        try:
+
+            if chat.type in ("group", "supergroup"):
+
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=(
+                        "✅ Promotion system activated.\n\n"
+                        "This group is now registered automatically."
+                    ),
+                )
+
+        except Exception:
+            pass
+
+    # Bot removed
+    elif new_status in (
+        ChatMemberStatus.LEFT,
+        ChatMemberStatus.KICKED,
+    ):
 
         try:
 
-            message = await send_payload(
-                bot,
-                user_id,
-                payload
+            await chats_col.update_one(
+                {"chat_id": chat.id},
+                {
+                    "$set": {
+                        "enabled": False,
+                        "updated_at": now(),
+                    }
+                },
             )
 
-            return message
-
-        except RetryAfter as e:
-
-            last_error = e
-
-            wait_seconds = int(
-                getattr(e, "retry_after", 1)
-            ) + 2
-
-            log.warning(
-                "Telegram rate limit. Waiting %s seconds",
-                wait_seconds
+            log.info(
+                "BOT REMOVED FROM CHAT: %s",
+                chat.id,
             )
 
-            await asyncio.sleep(wait_seconds)
-
-        except (TimedOut, NetworkError) as e:
-
-            last_error = e
-
-            if attempt >= MAX_SEND_RETRIES:
-                break
-
-            await asyncio.sleep(
-                2 ** attempt
-            )
-
-        except Exception as e:
-
-            last_error = e
-
-            # Permanent error.
-            break
-
-    if last_error:
-        raise last_error
-
-    raise RuntimeError(
-        "Unknown Telegram send error"
-    )
+        except Exception:
+            pass
 
 
 # ============================================================
 # START
 # ============================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
     user = update.effective_user
 
@@ -225,54 +337,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     existing = await users_col.find_one(
-        {
-            "user_id": user.id
-        }
+        {"user_id": user.id}
     )
-
-    # ========================================================
-    # EXISTING USER
-    # ========================================================
 
     if existing:
 
         await users_col.update_one(
-            {
-                "user_id": user.id
-            },
+            {"user_id": user.id},
             {
                 "$set": {
                     "name": user.full_name,
                     "username": user.username,
-                    "last_seen_at": datetime.now(
-                        timezone.utc
-                    ),
-                    "blocked": False
+                    "last_seen_at": now(),
+                    "blocked": False,
                 }
-            }
+            },
         )
 
-        # IMPORTANT:
-        # Do NOT send welcome again.
+        # No repeated message
         return
-
-    # ========================================================
-    # FIRST START
-    # ========================================================
 
     await users_col.insert_one(
         {
             "user_id": user.id,
             "name": user.full_name,
             "username": user.username,
-            "first_started_at": datetime.now(
-                timezone.utc
-            ),
-            "last_seen_at": datetime.now(
-                timezone.utc
-            ),
+            "first_started_at": now(),
+            "last_seen_at": now(),
             "welcome_sent": True,
-            "blocked": False
+            "blocked": False,
         }
     )
 
@@ -282,232 +375,66 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# HELP
-# ============================================================
-
-@admin_only
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.effective_message.reply_text(
-
-        "🔥 Broadcast + Auto Schedule Bot\n\n"
-
-        "👤 USER SYSTEM\n"
-        "/users - User statistics\n"
-        "/ubroadcast - Broadcast to users\n\n"
-
-        "📢 GROUP / CHANNEL\n"
-        "/broadcast - Broadcast to groups/channels\n"
-        "/addchat <chat_id> - Add chat\n"
-        "/removechat <chat_id> - Remove chat\n"
-        "/chats - Registered chats\n\n"
-
-        "🔄 SCHEDULE\n"
-        "/schedule - Create recurring schedule\n"
-        "/schedules - View schedules\n"
-        "/pause <id> - Pause\n"
-        "/resume <id> - Resume\n"
-        "/delete_schedule <id> - Delete\n\n"
-
-        "/cancel - Cancel current setup"
-    )
-
-
-# ============================================================
 # USERS
 # ============================================================
+
 
 @admin_only
 async def users(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     total = await users_col.count_documents({})
 
     active = await users_col.count_documents(
-        {
-            "blocked": {
-                "$ne": True
-            }
-        }
+        {"blocked": {"$ne": True}}
     )
 
     blocked = await users_col.count_documents(
-        {
-            "blocked": True
-        }
+        {"blocked": True}
     )
 
     await update.effective_message.reply_text(
-
-        "👥 USER MANAGEMENT\n\n"
-
+        "👥 USER STATISTICS\n\n"
         f"📊 Total Users: {total}\n"
-        f"🟢 Active Users: {active}\n"
-        f"🔴 Blocked Users: {blocked}"
-
+        f"🟢 Active: {active}\n"
+        f"🔴 Blocked: {blocked}"
     )
 
 
 # ============================================================
-# CHAT MANAGEMENT
+# CHATS
 # ============================================================
-
-@admin_only
-async def addchat(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not context.args:
-
-        await update.effective_message.reply_text(
-            "Usage:\n/addchat -1001234567890"
-        )
-
-        return
-
-    try:
-
-        chat_id = int(
-            context.args[0]
-        )
-
-    except ValueError:
-
-        await update.effective_message.reply_text(
-            "❌ Invalid chat ID."
-        )
-
-        return
-
-    try:
-
-        chat = await context.bot.get_chat(
-            chat_id
-        )
-
-        await chats_col.update_one(
-
-            {
-                "chat_id": chat_id
-            },
-
-            {
-                "$set": {
-                    "chat_id": chat_id,
-                    "title": chat.title or str(chat_id),
-                    "type": chat.type,
-                    "enabled": True,
-                    "updated_at": datetime.now(
-                        timezone.utc
-                    )
-                }
-            },
-
-            upsert=True
-        )
-
-        await update.effective_message.reply_text(
-
-            "✅ Chat added\n\n"
-
-            f"Title: {chat.title or '-'}\n"
-            f"Type: {chat.type}\n"
-            f"ID: {chat_id}"
-
-        )
-
-    except Exception as e:
-
-        await update.effective_message.reply_text(
-
-            "❌ Could not add chat.\n\n"
-            f"{e}\n\n"
-            "Make sure the bot is inside the group/channel "
-            "and has permission to post."
-
-        )
-
-
-@admin_only
-async def removechat(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not context.args:
-
-        await update.effective_message.reply_text(
-            "/removechat -1001234567890"
-        )
-
-        return
-
-    try:
-
-        chat_id = int(
-            context.args[0]
-        )
-
-    except ValueError:
-
-        await update.effective_message.reply_text(
-            "❌ Invalid chat ID."
-        )
-
-        return
-
-    await chats_col.update_one(
-
-        {
-            "chat_id": chat_id
-        },
-
-        {
-            "$set": {
-                "enabled": False
-            }
-        }
-    )
-
-    await update.effective_message.reply_text(
-        "✅ Chat removed from broadcast list."
-    )
 
 
 @admin_only
 async def chats(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    rows = await get_registered_chats()
+    rows = await chats_col.find(
+        {"enabled": True}
+    ).to_list(length=1000)
 
     if not rows:
 
         await update.effective_message.reply_text(
-            "❌ No registered groups/channels."
+            "❌ No groups/channels registered yet."
         )
-
         return
 
     lines = [
-        "📋 REGISTERED CHATS\n"
+        "📢 REGISTERED GROUPS / CHANNELS\n"
     ]
 
     for row in rows:
 
         lines.append(
-
             f"• {row.get('title', '-')}\n"
             f"  ID: {row['chat_id']}\n"
             f"  Type: {row.get('type', '-')}\n"
-
         )
 
     await update.effective_message.reply_text(
@@ -516,46 +443,74 @@ async def chats(
 
 
 # ============================================================
-# SETUP
+# HELP
 # ============================================================
 
-async def begin_setup(
+
+@admin_only
+async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    mode: str
 ):
 
-    reset_setup(context)
+    await update.effective_message.reply_text(
+        "🔥 PROMOTION BOT\n\n"
+
+        "👥 Users\n"
+        "/users\n"
+        "/ubroadcast\n\n"
+
+        "📢 Promotion\n"
+        "/broadcast\n\n"
+
+        "🔄 Auto Schedule\n"
+        "/schedule\n"
+        "/schedules\n"
+        "/pause ID\n"
+        "/resume ID\n"
+        "/delete_schedule ID\n\n"
+
+        "📋 Chats\n"
+        "/chats\n\n"
+
+        "❌ /cancel\n\n"
+
+        "ℹ️ No /addchat required.\n"
+        "When the bot is added to a group/channel, "
+        "it is automatically registered."
+    )
+
+
+# ============================================================
+# START SETUP
+# ============================================================
+
+
+async def begin_setup(
+    update,
+    context,
+    mode,
+):
+
+    clear_setup(context)
 
     context.user_data["setup"] = {
-
         "mode": mode,
-
         "step": "content",
-
         "photo_file_id": None,
-
         "text": None,
-
         "button_text": None,
-
         "button_url": None,
-
-        "interval": None
+        "interval": None,
     }
 
     await update.effective_message.reply_text(
-
         f"🚀 {mode.upper()} SETUP\n\n"
-
-        "🖼️ Send PHOTO with caption\n"
+        "🖼️ Send photo with caption\n"
         "OR\n"
-        "📝 Send TEXT only\n\n"
-
-        "Then I will ask for button.\n\n"
-
-        "Use /cancel to stop."
-
+        "📝 Send text\n\n"
+        "Then button setup will appear.\n\n"
+        "/cancel to cancel."
     )
 
 
@@ -563,16 +518,17 @@ async def begin_setup(
 # BROADCAST
 # ============================================================
 
+
 @admin_only
 async def broadcast(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context,
 ):
 
     await begin_setup(
         update,
         context,
-        "broadcast"
+        "broadcast",
     )
 
 
@@ -580,16 +536,17 @@ async def broadcast(
 # USER BROADCAST
 # ============================================================
 
+
 @admin_only
 async def ubroadcast(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context,
 ):
 
     await begin_setup(
         update,
         context,
-        "ubroadcast"
+        "ubroadcast",
     )
 
 
@@ -597,16 +554,17 @@ async def ubroadcast(
 # SCHEDULE
 # ============================================================
 
+
 @admin_only
 async def schedule(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context,
 ):
 
     await begin_setup(
         update,
         context,
-        "schedule"
+        "schedule",
     )
 
 
@@ -614,14 +572,13 @@ async def schedule(
 # CAPTURE CONTENT
 # ============================================================
 
+
 async def capture_content(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context,
 ):
 
-    setup = context.user_data.get(
-        "setup"
-    )
+    setup = context.user_data.get("setup")
 
     if not setup:
         return
@@ -631,7 +588,6 @@ async def capture_content(
 
     message = update.effective_message
 
-    # PHOTO
     if message.photo:
 
         setup["photo_file_id"] = (
@@ -642,14 +598,12 @@ async def capture_content(
             message.caption or ""
         )
 
-    # TEXT
     elif message.text:
 
         if message.text.startswith("/"):
             return
 
         setup["photo_file_id"] = None
-
         setup["text"] = message.text
 
     else:
@@ -659,35 +613,25 @@ async def capture_content(
     setup["step"] = "button"
 
     await message.reply_text(
-
-        "🔘 BUTTON SETUP\n\n"
-
-        "Send button like this:\n\n"
-
+        "🔘 BUTTON\n\n"
+        "Send:\n\n"
         "Button Text | https://example.com\n\n"
-
-        "OR\n\n"
-
-        "skip\n\n"
-
-        "Example:\n"
-        "Join Now | https://t.me/example"
-
+        "OR send:\n"
+        "skip"
     )
 
 
 # ============================================================
-# CAPTURE BUTTON
+# BUTTON
 # ============================================================
+
 
 async def capture_button(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context,
 ):
 
-    setup = context.user_data.get(
-        "setup"
-    )
+    setup = context.user_data.get("setup")
 
     if not setup:
         return
@@ -699,7 +643,6 @@ async def capture_button(
         update.effective_message.text or ""
     ).strip()
 
-    # NO BUTTON
     if text.lower() == "skip":
 
         setup["button_text"] = None
@@ -710,28 +653,15 @@ async def capture_button(
         if "|" not in text:
 
             await update.effective_message.reply_text(
-
-                "❌ Wrong format.\n\n"
-
-                "Use:\n"
+                "❌ Use:\n"
                 "Button Text | https://example.com"
-
             )
-
             return
 
         button_text, button_url = (
             x.strip()
             for x in text.split("|", 1)
         )
-
-        if not button_text:
-
-            await update.effective_message.reply_text(
-                "❌ Button text is empty."
-            )
-
-            return
 
         if not (
             button_url.startswith("https://")
@@ -742,172 +672,130 @@ async def capture_button(
             await update.effective_message.reply_text(
                 "❌ Invalid URL."
             )
-
             return
 
-        setup["button_text"] = (
-            button_text[:64]
-        )
-
+        setup["button_text"] = button_text[:64]
         setup["button_url"] = button_url
 
-    # ========================================================
-    # MANUAL BROADCAST
-    # ========================================================
-
+    # Broadcast
     if setup["mode"] == "broadcast":
 
-        await do_manual_broadcast(
+        await execute_chat_broadcast(
             update,
-            context
+            context,
         )
 
         return
 
-    # ========================================================
-    # USER BROADCAST
-    # ========================================================
-
+    # User broadcast
     if setup["mode"] == "ubroadcast":
 
-        await do_user_broadcast(
+        await execute_user_broadcast(
             update,
-            context
+            context,
         )
 
         return
 
-    # ========================================================
-    # SCHEDULE
-    # ========================================================
-
+    # Schedule
     if setup["mode"] == "schedule":
 
         setup["step"] = "interval"
 
         await update.effective_message.reply_text(
-
-            "⏱️ SELECT INTERVAL\n\n"
-
-            "Send one:\n\n"
-
+            "⏱️ SEND SCHEDULE INTERVAL\n\n"
             "10m\n"
             "15m\n"
             "30m\n"
             "1h"
-
         )
 
 
 # ============================================================
-# MANUAL GROUP/CHANNEL BROADCAST
+# CHAT BROADCAST
 # ============================================================
 
-async def do_manual_broadcast(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+
+async def execute_chat_broadcast(
+    update,
+    context,
 ):
 
-    setup = context.user_data.get(
-        "setup"
-    )
+    setup = context.user_data.get("setup")
 
-    payload = {
+    payload = build_payload(setup)
 
-        "photo_file_id":
-            setup["photo_file_id"],
+    rows = await chats_col.find(
+        {"enabled": True}
+    ).to_list(length=1000)
 
-        "text":
-            setup["text"] or "",
-
-        "button_text":
-            setup["button_text"],
-
-        "button_url":
-            setup["button_url"]
-
-    }
-
-    chats_list = await get_registered_chats()
-
-    total = len(chats_list)
+    total = len(rows)
 
     if total == 0:
 
-        reset_setup(context)
+        clear_setup(context)
 
         await update.effective_message.reply_text(
-
-            "❌ No groups/channels registered.\n\n"
-
-            "Use:\n"
-            "/addchat <chat_id>"
-
+            "❌ No registered groups/channels."
         )
-
         return
 
     progress = await update.effective_message.reply_text(
-
         "📢 BROADCAST STARTING...\n\n"
-
         f"📦 Total: {total}\n"
         "✅ Sent: 0\n"
         "⏳ Remaining: "
         f"{total}\n"
         "❌ Failed: 0\n"
         "📊 Progress: 0%"
-
     )
 
     sent = 0
     failed = 0
 
-    for index, chat in enumerate(
-        chats_list,
-        start=1
+    for index, row in enumerate(
+        rows,
+        start=1,
     ):
 
-        chat_id = chat["chat_id"]
+        chat_id = row["chat_id"]
 
         try:
 
             await send_payload(
                 context.bot,
                 chat_id,
-                payload
+                payload,
             )
 
             sent += 1
 
         except RetryAfter as e:
 
-            wait_seconds = (
+            wait = (
                 int(
                     getattr(
                         e,
                         "retry_after",
-                        1
+                        1,
                     )
-                ) + 2
+                )
+                + 2
             )
 
-            await asyncio.sleep(
-                wait_seconds
-            )
+            await asyncio.sleep(wait)
 
             try:
 
                 await send_payload(
                     context.bot,
                     chat_id,
-                    payload
+                    payload,
                 )
 
                 sent += 1
 
             except Exception:
-
                 failed += 1
 
         except Exception as e:
@@ -917,63 +805,46 @@ async def do_manual_broadcast(
             log.warning(
                 "Broadcast failed %s: %s",
                 chat_id,
-                e
+                e,
             )
 
-        # Small safe delay
         await asyncio.sleep(
-            0.3
+            CHAT_SEND_DELAY
         )
 
-        # LIVE PROGRESS
         if (
             index % PROGRESS_EVERY == 0
             or index == total
         ):
 
-            remaining = (
-                total - index
-            )
+            remaining = total - index
 
             percent = round(
                 index / total * 100,
-                1
+                1,
             )
 
             try:
 
                 await progress.edit_text(
-
                     "📢 BROADCASTING...\n\n"
-
                     f"📦 Total: {total}\n"
                     f"✅ Sent: {sent}\n"
                     f"⏳ Remaining: {remaining}\n"
                     f"❌ Failed: {failed}\n"
                     f"📊 Progress: {percent}%"
-
                 )
 
             except Exception:
                 pass
 
-    reset_setup(context)
-
-    success_rate = (
-        sent / total * 100
-        if total
-        else 0
-    )
+    clear_setup(context)
 
     await progress.edit_text(
-
         "✅ BROADCAST COMPLETED\n\n"
-
         f"📦 Total: {total}\n"
         f"✅ Sent: {sent}\n"
-        f"❌ Failed: {failed}\n"
-        f"📈 Success: {success_rate:.1f}%"
-
+        f"❌ Failed: {failed}"
     )
 
 
@@ -981,59 +852,81 @@ async def do_manual_broadcast(
 # USER BROADCAST
 # ============================================================
 
-async def do_user_broadcast(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+
+async def safe_user_send(
+    bot,
+    user_id,
+    payload,
 ):
 
-    setup = context.user_data.get(
-        "setup"
+    for attempt in range(MAX_RETRIES + 1):
+
+        try:
+
+            return await send_payload(
+                bot,
+                user_id,
+                payload,
+            )
+
+        except RetryAfter as e:
+
+            wait = (
+                int(
+                    getattr(
+                        e,
+                        "retry_after",
+                        1,
+                    )
+                )
+                + 2
+            )
+
+            await asyncio.sleep(wait)
+
+        except (TimedOut, NetworkError):
+
+            if attempt >= MAX_RETRIES:
+                raise
+
+            await asyncio.sleep(
+                2 ** attempt
+            )
+
+    raise RuntimeError(
+        "Could not send message"
     )
 
-    payload = {
 
-        "photo_file_id":
-            setup["photo_file_id"],
+async def execute_user_broadcast(
+    update,
+    context,
+):
 
-        "text":
-            setup["text"] or "",
+    setup = context.user_data.get("setup")
 
-        "button_text":
-            setup["button_text"],
-
-        "button_url":
-            setup["button_url"]
-
-    }
+    payload = build_payload(setup)
 
     total = await users_col.count_documents(
-        {
-            "blocked": {
-                "$ne": True
-            }
-        }
+        {"blocked": {"$ne": True}}
     )
 
     if total == 0:
 
-        reset_setup(context)
+        clear_setup(context)
 
         await update.effective_message.reply_text(
-            "❌ No users found."
+            "❌ No users."
         )
-
         return
 
     progress = await update.effective_message.reply_text(
-
         "📢 USER BROADCAST STARTING...\n\n"
-
         f"👥 Total: {total}\n"
         "✅ Sent: 0\n"
         f"⏳ Remaining: {total}\n"
         "❌ Failed: 0\n"
         "📊 Progress: 0%"
-
     )
 
     sent = 0
@@ -1041,17 +934,11 @@ async def do_user_broadcast(
     processed = 0
 
     cursor = users_col.find(
-        {
-            "blocked": {
-                "$ne": True
-            }
-        },
-        {
-            "user_id": 1
-        }
+        {"blocked": {"$ne": True}},
+        {"user_id": 1},
     ).sort(
         "_id",
-        1
+        1,
     )
 
     async for row in cursor:
@@ -1062,10 +949,10 @@ async def do_user_broadcast(
 
         try:
 
-            await safe_send_user(
+            await safe_user_send(
                 context.bot,
                 user_id,
-                payload
+                payload,
             )
 
             sent += 1
@@ -1074,43 +961,30 @@ async def do_user_broadcast(
 
             failed += 1
 
-            error_text = str(
-                e
-            ).lower()
+            error = str(e).lower()
 
-            # Mark permanently unavailable users.
             if (
-                "blocked" in error_text
-                or "deactivated" in error_text
-                or "chat not found" in error_text
-                or "user is deactivated" in error_text
+                "blocked" in error
+                or "deactivated" in error
+                or "chat not found" in error
             ):
 
                 await users_col.update_one(
-
-                    {
-                        "user_id": user_id
-                    },
-
+                    {"user_id": user_id},
                     {
                         "$set": {
                             "blocked": True,
-                            "blocked_at":
-                                datetime.now(
-                                    timezone.utc
-                                )
+                            "blocked_at": now(),
                         }
-                    }
+                    },
                 )
 
         processed += 1
 
-        # Conservative delay
         await asyncio.sleep(
             USER_SEND_DELAY
         )
 
-        # LIVE PROGRESS
         if (
             processed % PROGRESS_EVERY == 0
             or processed == total
@@ -1118,80 +992,57 @@ async def do_user_broadcast(
 
             remaining = max(
                 total - processed,
-                0
+                0,
             )
 
             percent = round(
                 processed / total * 100,
-                1
+                1,
             )
 
             try:
 
                 await progress.edit_text(
-
                     "📢 USER BROADCASTING...\n\n"
-
                     f"👥 Total: {total}\n"
                     f"✅ Sent: {sent}\n"
                     f"⏳ Remaining: {remaining}\n"
                     f"❌ Failed: {failed}\n"
                     f"📊 Progress: {percent}%"
-
                 )
 
             except Exception:
                 pass
 
-    reset_setup(context)
-
-    success_rate = (
-        sent / total * 100
-        if total
-        else 0
-    )
+    clear_setup(context)
 
     await progress.edit_text(
-
         "✅ USER BROADCAST COMPLETED\n\n"
-
         f"👥 Total: {total}\n"
-        f"✅ Successfully Sent: {sent}\n"
-        f"❌ Failed: {failed}\n"
-        f"📈 Success Rate: {success_rate:.1f}%"
-
+        f"✅ Sent: {sent}\n"
+        f"❌ Failed: {failed}"
     )
 
 
 # ============================================================
-# SCHEDULE INTERVALS
+# SCHEDULE INTERVAL
 # ============================================================
 
+
 INTERVALS = {
-
-    "10m": 10 * 60,
-
-    "15m": 15 * 60,
-
-    "30m": 30 * 60,
-
-    "1h": 60 * 60
-
+    "10m": 600,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
 }
 
 
-# ============================================================
-# CAPTURE SCHEDULE INTERVAL
-# ============================================================
-
 async def capture_interval(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context,
 ):
 
-    setup = context.user_data.get(
-        "setup"
-    )
+    setup = context.user_data.get("setup")
 
     if not setup:
         return
@@ -1206,66 +1057,25 @@ async def capture_interval(
     if value not in INTERVALS:
 
         await update.effective_message.reply_text(
-
-            "❌ Invalid interval.\n\n"
-
-            "Choose:\n"
+            "❌ Invalid.\n\n"
+            "Use:\n"
             "10m\n"
             "15m\n"
             "30m\n"
             "1h"
-
         )
-
         return
 
-    setup["interval"] = (
-        INTERVALS[value]
-    )
-
-    payload = {
-
-        "photo_file_id":
-            setup["photo_file_id"],
-
-        "text":
-            setup["text"] or "",
-
-        "button_text":
-            setup["button_text"],
-
-        "button_url":
-            setup["button_url"]
-
-    }
+    payload = build_payload(setup)
 
     doc = {
-
-        "interval":
-            setup["interval"],
-
-        "interval_label":
-            value,
-
-        "payload":
-            payload,
-
-        "enabled":
-            True,
-
-        "last_messages":
-            {},
-
-        "created_at":
-            datetime.now(
-                timezone.utc
-            ),
-
-        "updated_at":
-            datetime.now(
-                timezone.utc
-            )
-
+        "interval": INTERVALS[value],
+        "interval_label": value,
+        "payload": payload,
+        "enabled": True,
+        "last_messages": {},
+        "created_at": now(),
+        "updated_at": now(),
     }
 
     result = await schedules_col.insert_one(
@@ -1276,54 +1086,44 @@ async def capture_interval(
         result.inserted_id
     )
 
-    # Send immediately
+    # Immediate first send
     await run_schedule(
         schedule_id,
-        context.application
+        context.application,
     )
 
-    # Then repeat
     context.application.job_queue.run_repeating(
-
         scheduled_job,
-
-        interval=setup["interval"],
-
-        first=setup["interval"],
-
+        interval=INTERVALS[value],
+        first=INTERVALS[value],
         data={
-            "schedule_id":
-                schedule_id
+            "schedule_id": schedule_id
         },
-
-        name=f"schedule:{schedule_id}"
-
+        name=f"schedule:{schedule_id}",
     )
 
-    reset_setup(context)
+    clear_setup(context)
 
     await update.effective_message.reply_text(
-
-        "✅ AUTO SCHEDULE CREATED\n\n"
-
-        f"🆔 ID: {schedule_id}\n"
-        f"⏱ Interval: {value}\n"
-        "🔄 Auto Delete: ON\n"
-        "👥 Groups + Channels: Enabled Chats\n\n"
-
-        "The first message was sent immediately."
-
+        "✅ SCHEDULE CREATED\n\n"
+        f"🆔 {schedule_id}\n"
+        f"⏱ Every {value}\n"
+        "🔄 Old message → DELETE\n"
+        "📸 New message → SEND\n\n"
+        "It will automatically work in "
+        "all registered groups/channels."
     )
 
 
 # ============================================================
-# DELETE OLD SCHEDULE MESSAGE
+# RUN SCHEDULE
 # ============================================================
 
-async def delete_previous_message(
+
+async def delete_message_safe(
     bot,
     chat_id,
-    message_id
+    message_id,
 ):
 
     if not message_id:
@@ -1332,30 +1132,42 @@ async def delete_previous_message(
     try:
 
         await bot.delete_message(
-
             chat_id=chat_id,
-
-            message_id=message_id
-
+            message_id=message_id,
         )
 
-    except Exception as e:
+    except RetryAfter as e:
 
-        log.info(
-            "Old message already unavailable %s/%s: %s",
-            chat_id,
-            message_id,
-            e
+        wait = (
+            int(
+                getattr(
+                    e,
+                    "retry_after",
+                    1,
+                )
+            )
+            + 2
         )
 
+        await asyncio.sleep(wait)
 
-# ============================================================
-# RUN SCHEDULE
-# ============================================================
+        try:
+
+            await bot.delete_message(
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
 
 async def run_schedule(
     schedule_id,
-    application
+    application,
 ):
 
     try:
@@ -1365,16 +1177,13 @@ async def run_schedule(
         )
 
     except Exception:
-
         return
 
     doc = await schedules_col.find_one(
-
         {
             "_id": object_id,
-            "enabled": True
+            "enabled": True,
         }
-
     )
 
     if not doc:
@@ -1382,49 +1191,35 @@ async def run_schedule(
 
     payload = doc["payload"]
 
-    chats_list = await get_registered_chats()
+    rows = await chats_col.find(
+        {"enabled": True}
+    ).to_list(length=1000)
 
     old_messages = doc.get(
         "last_messages",
-        {}
+        {},
     )
 
-    new_messages = dict(
-        old_messages
-    )
+    new_messages = {}
 
-    for chat in chats_list:
+    for row in rows:
 
-        chat_id = chat["chat_id"]
+        chat_id = row["chat_id"]
+        key = str(chat_id)
 
-        key = str(
-            chat_id
+        # Delete previous scheduled message
+        await delete_message_safe(
+            application.bot,
+            chat_id,
+            old_messages.get(key),
         )
 
         try:
 
-            # Delete old message
-            await delete_previous_message(
-
-                application.bot,
-
-                chat_id,
-
-                old_messages.get(
-                    key
-                )
-
-            )
-
-            # Send new message
             message = await send_payload(
-
                 application.bot,
-
                 chat_id,
-
-                payload
-
+                payload,
             )
 
             new_messages[key] = (
@@ -1433,30 +1228,25 @@ async def run_schedule(
 
         except RetryAfter as e:
 
-            wait_seconds = (
+            wait = (
                 int(
                     getattr(
                         e,
                         "retry_after",
-                        1
+                        1,
                     )
-                ) + 2
+                )
+                + 2
             )
 
-            await asyncio.sleep(
-                wait_seconds
-            )
+            await asyncio.sleep(wait)
 
             try:
 
                 message = await send_payload(
-
                     application.bot,
-
                     chat_id,
-
-                    payload
-
+                    payload,
                 )
 
                 new_messages[key] = (
@@ -1468,47 +1258,29 @@ async def run_schedule(
                 log.warning(
                     "Schedule retry failed %s: %s",
                     chat_id,
-                    retry_error
+                    retry_error,
                 )
 
         except Exception as e:
 
             log.warning(
-
-                "Schedule %s failed for %s: %s",
-
-                schedule_id,
-
+                "Schedule failed %s: %s",
                 chat_id,
-
-                e
-
+                e,
             )
 
         await asyncio.sleep(
-            0.3
+            CHAT_SEND_DELAY
         )
 
     await schedules_col.update_one(
-
-        {
-            "_id": object_id
-        },
-
+        {"_id": object_id},
         {
             "$set": {
-
-                "last_messages":
-                    new_messages,
-
-                "updated_at":
-                    datetime.now(
-                        timezone.utc
-                    )
-
+                "last_messages": new_messages,
+                "updated_at": now(),
             }
-        }
-
+        },
     )
 
 
@@ -1516,8 +1288,9 @@ async def run_schedule(
 # SCHEDULE JOB
 # ============================================================
 
+
 async def scheduled_job(
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     schedule_id = (
@@ -1526,37 +1299,34 @@ async def scheduled_job(
 
     await run_schedule(
         schedule_id,
-        context.application
+        context.application,
     )
 
 
 # ============================================================
-# RESTORE SCHEDULES
+# RESTORE SCHEDULES AFTER RENDER RESTART
 # ============================================================
 
+
 async def restore_schedules(
-    application
+    application,
 ):
 
     rows = await schedules_col.find(
-        {
-            "enabled": True
-        }
-    ).to_list(
-        length=1000
-    )
+        {"enabled": True}
+    ).to_list(length=1000)
 
-    for doc in rows:
+    for row in rows:
 
         schedule_id = str(
-            doc["_id"]
+            row["_id"]
         )
 
         interval = int(
-            doc["interval"]
+            row["interval"]
         )
 
-        # Remove duplicate jobs
+        # Prevent duplicate jobs
         for job in application.job_queue.get_jobs_by_name(
             f"schedule:{schedule_id}"
         ):
@@ -1564,25 +1334,18 @@ async def restore_schedules(
             job.schedule_removal()
 
         application.job_queue.run_repeating(
-
             scheduled_job,
-
             interval=interval,
-
             first=interval,
-
             data={
-                "schedule_id":
-                    schedule_id
+                "schedule_id": schedule_id
             },
-
-            name=f"schedule:{schedule_id}"
-
+            name=f"schedule:{schedule_id}",
         )
 
     log.info(
         "Restored %d schedules",
-        len(rows)
+        len(rows),
     )
 
 
@@ -1590,49 +1353,45 @@ async def restore_schedules(
 # LIST SCHEDULES
 # ============================================================
 
+
 @admin_only
 async def schedules(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context,
 ):
 
     rows = await schedules_col.find().sort(
         "created_at",
-        -1
-    ).to_list(
-        length=100
-    )
+        -1,
+    ).to_list(length=100)
 
     if not rows:
 
         await update.effective_message.reply_text(
             "❌ No schedules."
         )
-
         return
 
     lines = [
-        "🔄 ACTIVE SCHEDULES\n"
+        "🔄 SCHEDULES\n"
     ]
 
-    for doc in rows:
+    for row in rows:
 
         sid = str(
-            doc["_id"]
+            row["_id"]
         )
 
         status = (
             "🟢 ON"
-            if doc.get("enabled")
+            if row.get("enabled")
             else "⏸ OFF"
         )
 
         lines.append(
-
             f"{status}\n"
             f"🆔 {sid}\n"
-            f"⏱ {doc.get('interval_label', '-')}\n"
-
+            f"⏱ {row.get('interval_label', '-')}\n"
         )
 
     await update.effective_message.reply_text(
@@ -1644,10 +1403,11 @@ async def schedules(
 # PAUSE
 # ============================================================
 
+
 @admin_only
 async def pause(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context,
 ):
 
     if not context.args:
@@ -1655,41 +1415,29 @@ async def pause(
         await update.effective_message.reply_text(
             "/pause <schedule_id>"
         )
-
         return
 
     sid = context.args[0]
 
     try:
 
-        object_id = ObjectId(
-            sid
-        )
+        object_id = ObjectId(sid)
 
     except Exception:
 
         await update.effective_message.reply_text(
-            "❌ Invalid schedule ID."
+            "❌ Invalid ID."
         )
-
         return
 
     result = await schedules_col.update_one(
-
-        {
-            "_id": object_id
-        },
-
+        {"_id": object_id},
         {
             "$set": {
                 "enabled": False,
-                "updated_at":
-                    datetime.now(
-                        timezone.utc
-                    )
+                "updated_at": now(),
             }
-        }
-
+        },
     )
 
     for job in context.application.job_queue.get_jobs_by_name(
@@ -1715,10 +1463,11 @@ async def pause(
 # RESUME
 # ============================================================
 
+
 @admin_only
 async def resume(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context,
 ):
 
     if not context.args:
@@ -1726,55 +1475,40 @@ async def resume(
         await update.effective_message.reply_text(
             "/resume <schedule_id>"
         )
-
         return
 
     sid = context.args[0]
 
     try:
 
-        object_id = ObjectId(
-            sid
-        )
+        object_id = ObjectId(sid)
 
     except Exception:
 
         await update.effective_message.reply_text(
-            "❌ Invalid schedule ID."
+            "❌ Invalid ID."
         )
-
         return
 
-    doc = await schedules_col.find_one(
-        {
-            "_id": object_id
-        }
+    row = await schedules_col.find_one(
+        {"_id": object_id}
     )
 
-    if not doc:
+    if not row:
 
         await update.effective_message.reply_text(
             "❌ Schedule not found."
         )
-
         return
 
     await schedules_col.update_one(
-
-        {
-            "_id": object_id
-        },
-
+        {"_id": object_id},
         {
             "$set": {
                 "enabled": True,
-                "updated_at":
-                    datetime.now(
-                        timezone.utc
-                    )
+                "updated_at": now(),
             }
-        }
-
+        },
     )
 
     for job in context.application.job_queue.get_jobs_by_name(
@@ -1784,22 +1518,13 @@ async def resume(
         job.schedule_removal()
 
     context.application.job_queue.run_repeating(
-
         scheduled_job,
-
-        interval=int(
-            doc["interval"]
-        ),
-
+        interval=int(row["interval"]),
         first=1,
-
         data={
-            "schedule_id":
-                sid
+            "schedule_id": sid
         },
-
-        name=f"schedule:{sid}"
-
+        name=f"schedule:{sid}",
     )
 
     await update.effective_message.reply_text(
@@ -1811,10 +1536,11 @@ async def resume(
 # DELETE SCHEDULE
 # ============================================================
 
+
 @admin_only
 async def delete_schedule(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context,
 ):
 
     if not context.args:
@@ -1822,64 +1548,46 @@ async def delete_schedule(
         await update.effective_message.reply_text(
             "/delete_schedule <schedule_id>"
         )
-
         return
 
     sid = context.args[0]
 
     try:
 
-        object_id = ObjectId(
-            sid
-        )
+        object_id = ObjectId(sid)
 
     except Exception:
 
         await update.effective_message.reply_text(
-            "❌ Invalid schedule ID."
+            "❌ Invalid ID."
         )
-
         return
 
-    doc = await schedules_col.find_one(
-        {
-            "_id": object_id
-        }
+    row = await schedules_col.find_one(
+        {"_id": object_id}
     )
 
-    if not doc:
+    if not row:
 
         await update.effective_message.reply_text(
             "❌ Schedule not found."
         )
-
         return
 
-    # Delete currently visible scheduled messages
-    last_messages = doc.get(
+    # Delete last scheduled messages
+    for chat_id, message_id in row.get(
         "last_messages",
-        {}
-    )
+        {},
+    ).items():
 
-    for chat_id, message_id in last_messages.items():
-
-        try:
-
-            await context.bot.delete_message(
-
-                chat_id=int(chat_id),
-
-                message_id=int(message_id)
-
-            )
-
-        except Exception:
-            pass
+        await delete_message_safe(
+            context.bot,
+            int(chat_id),
+            int(message_id),
+        )
 
     await schedules_col.delete_one(
-        {
-            "_id": object_id
-        }
+        {"_id": object_id}
     )
 
     for job in context.application.job_queue.get_jobs_by_name(
@@ -1889,10 +1597,7 @@ async def delete_schedule(
         job.schedule_removal()
 
     await update.effective_message.reply_text(
-
-        "🗑 Schedule deleted.\n"
-        "Current scheduled messages removed."
-
+        "🗑 Schedule deleted."
     )
 
 
@@ -1900,82 +1605,82 @@ async def delete_schedule(
 # CANCEL
 # ============================================================
 
+
 @admin_only
 async def cancel(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context,
 ):
 
-    reset_setup(context)
+    clear_setup(context)
 
     await update.effective_message.reply_text(
-        "❌ Setup cancelled."
+        "❌ Cancelled."
     )
 
 
 # ============================================================
-# SETUP ROUTER
+# SETUP MESSAGE ROUTER
 # ============================================================
+
 
 async def setup_router(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context,
 ):
 
-    setup = context.user_data.get(
-        "setup"
-    )
+    setup = context.user_data.get("setup")
 
     if not setup:
         return
 
-    step = setup.get(
-        "step"
-    )
+    step = setup.get("step")
 
     if step == "content":
 
         await capture_content(
             update,
-            context
+            context,
         )
 
     elif step == "button":
 
         await capture_button(
             update,
-            context
+            context,
         )
 
     elif step == "interval":
 
         await capture_interval(
             update,
-            context
+            context,
         )
 
 
 # ============================================================
-# ERROR HANDLER
+# ERROR
 # ============================================================
+
 
 async def error_handler(
     update,
-    context: ContextTypes.DEFAULT_TYPE
+    context,
 ):
 
     log.exception(
-        "Unhandled exception:",
-        exc_info=context.error
+        "Unhandled error:",
+        exc_info=context.error,
     )
 
 
 # ============================================================
-# STARTUP
+# POST INIT
 # ============================================================
 
+
 async def post_init(
-    application
+    application,
 ):
 
     global mongo
@@ -1994,31 +1699,20 @@ async def post_init(
         MONGO_URI
     )
 
-    db = mongo[
-        DB_NAME
-    ]
+    db = mongo[DB_NAME]
 
-    users_col = db[
-        "users"
-    ]
+    users_col = db["users"]
+    chats_col = db["chats"]
+    schedules_col = db["schedules"]
 
-    chats_col = db[
-        "chats"
-    ]
-
-    schedules_col = db[
-        "schedules"
-    ]
-
-    # Indexes
     await users_col.create_index(
         "user_id",
-        unique=True
+        unique=True,
     )
 
     await chats_col.create_index(
         "chat_id",
-        unique=True
+        unique=True,
     )
 
     await schedules_col.create_index(
@@ -2030,16 +1724,17 @@ async def post_init(
     )
 
     log.info(
-        "Bot initialized successfully."
+        "Database initialized."
     )
 
 
 # ============================================================
-# SHUTDOWN
+# POST SHUTDOWN
 # ============================================================
 
+
 async def post_shutdown(
-    application
+    application,
 ):
 
     global mongo
@@ -2057,6 +1752,7 @@ async def post_shutdown(
 # MAIN
 # ============================================================
 
+
 def main():
 
     if not BOT_TOKEN:
@@ -2072,23 +1768,11 @@ def main():
         )
 
     application = (
-
         Application.builder()
-
-        .token(
-            BOT_TOKEN
-        )
-
-        .post_init(
-            post_init
-        )
-
-        .post_shutdown(
-            post_shutdown
-        )
-
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
-
     )
 
     # ========================================================
@@ -2096,125 +1780,81 @@ def main():
     # ========================================================
 
     application.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
+        CommandHandler("start", start)
     )
 
     application.add_handler(
-        CommandHandler(
-            "help",
-            help_command
-        )
+        CommandHandler("help", help_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "users",
-            users
-        )
+        CommandHandler("users", users)
     )
 
     application.add_handler(
-        CommandHandler(
-            "broadcast",
-            broadcast
-        )
+        CommandHandler("broadcast", broadcast)
     )
 
     application.add_handler(
-        CommandHandler(
-            "ubroadcast",
-            ubroadcast
-        )
+        CommandHandler("ubroadcast", ubroadcast)
     )
 
     application.add_handler(
-        CommandHandler(
-            "schedule",
-            schedule
-        )
+        CommandHandler("schedule", schedule)
     )
 
     application.add_handler(
-        CommandHandler(
-            "schedules",
-            schedules
-        )
+        CommandHandler("schedules", schedules)
     )
 
     application.add_handler(
-        CommandHandler(
-            "pause",
-            pause
-        )
+        CommandHandler("pause", pause)
     )
 
     application.add_handler(
-        CommandHandler(
-            "resume",
-            resume
-        )
+        CommandHandler("resume", resume)
     )
 
     application.add_handler(
         CommandHandler(
             "delete_schedule",
-            delete_schedule
+            delete_schedule,
         )
     )
 
     application.add_handler(
-        CommandHandler(
-            "addchat",
-            addchat
+        CommandHandler("cancel", cancel)
+    )
+
+    # ========================================================
+    # AUTOMATIC CHAT DETECTION
+    # ========================================================
+
+    application.add_handler(
+        ChatMemberHandler(
+            chat_member_update,
+            ChatMemberHandler.CHAT_MEMBER,
         )
     )
 
     application.add_handler(
-        CommandHandler(
-            "removechat",
-            removechat
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "chats",
-            chats
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "cancel",
-            cancel
+        ChatMemberHandler(
+            my_chat_member_update,
+            ChatMemberHandler.MY_CHAT_MEMBER,
         )
     )
 
     # ========================================================
-    # SETUP MESSAGE HANDLER
+    # SETUP CONTENT
     # ========================================================
 
     application.add_handler(
-
         MessageHandler(
-
-            (
-                filters.PHOTO
-                |
-                (
-                    filters.TEXT
-                    &
-                    ~filters.COMMAND
-                )
+            filters.PHOTO | (
+                filters.TEXT & ~filters.COMMAND
             ),
-
-            setup_router
-
+            setup_router,
         )
-
     )
 
     application.add_error_handler(
@@ -2222,12 +1862,12 @@ def main():
     )
 
     log.info(
-        "Starting Telegram polling..."
+        "Starting bot..."
     )
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=False
+        drop_pending_updates=False,
     )
 
 
