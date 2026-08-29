@@ -52,16 +52,9 @@ ADMIN_IDS = {
 # SAFE RATE LIMITS
 # ============================================================
 
-# Group/channel sending delay
 CHAT_SEND_DELAY = 1.2
-
-# User broadcast delay
 USER_SEND_DELAY = 1.5
-
-# Progress message update frequency
 PROGRESS_EVERY = 10
-
-# Retry count
 MAX_RETRIES = 3
 
 
@@ -177,7 +170,6 @@ async def send_payload(bot, chat_id, payload):
         )
 
     if not text:
-
         text = " "
 
     return await bot.send_message(
@@ -276,7 +268,6 @@ async def my_chat_member_update(
 
         await register_chat(chat)
 
-        # Optional activation message for groups
         if chat.type in (
             "group",
             "supergroup",
@@ -383,7 +374,6 @@ async def start(
             },
         )
 
-        # Do NOT send welcome again
         return
 
     await users_col.insert_one(
@@ -507,6 +497,7 @@ async def help_command(
         "/schedules\n"
         "/pause ID\n"
         "/resume ID\n"
+        "/stopall\n"
         "/delete_schedule ID\n\n"
 
         "📊 CHATS\n"
@@ -631,7 +622,6 @@ async def capture_content(
     elif message.text:
 
         setup["photo_file_id"] = None
-
         setup["text"] = message.text
 
     else:
@@ -1497,7 +1487,6 @@ async def restore_schedules(
             row["_id"]
         )
 
-        # Remove duplicate jobs if any
         for job in (
             application
             .job_queue
@@ -1583,7 +1572,7 @@ async def schedules(
 
 
 # ============================================================
-# PAUSE
+# PAUSE ONE SCHEDULE
 # ============================================================
 
 @admin_only
@@ -1652,7 +1641,7 @@ async def pause(
 
 
 # ============================================================
-# RESUME
+# RESUME ONE SCHEDULE
 # ============================================================
 
 @admin_only
@@ -1739,6 +1728,68 @@ async def resume(
 
 
 # ============================================================
+# STOP ALL SCHEDULES
+# ============================================================
+
+@admin_only
+async def stop_all_schedules(
+    update,
+    context,
+):
+
+    # --------------------------------------------------------
+    # STOP ALL ACTIVE SCHEDULES IN DATABASE
+    # --------------------------------------------------------
+
+    result = await schedules_col.update_many(
+        {
+            "enabled": True
+        },
+        {
+            "$set": {
+                "enabled": False,
+                "updated_at": now(),
+            }
+        },
+    )
+
+    # --------------------------------------------------------
+    # REMOVE ALL SCHEDULE JOBS
+    # --------------------------------------------------------
+
+    removed_jobs = 0
+
+    for job in context.application.job_queue.jobs():
+
+        if job.name and job.name.startswith("schedule:"):
+
+            job.schedule_removal()
+
+            removed_jobs += 1
+
+    # --------------------------------------------------------
+    # RESULT
+    # --------------------------------------------------------
+
+    if result.modified_count == 0 and removed_jobs == 0:
+
+        await update.effective_message.reply_text(
+            "ℹ️ NO ACTIVE SCHEDULES\n\n"
+            "There are no running schedules."
+        )
+
+        return
+
+    await update.effective_message.reply_text(
+        "🛑 ALL SCHEDULES STOPPED\n\n"
+        f"🔴 Stopped: {result.modified_count}\n"
+        f"⏹️ Jobs removed: {removed_jobs}\n\n"
+        "💾 Schedules are still saved.\n"
+        "▶️ Use /resume ID to start one again."
+    )
+
+
+# ============================================================
 # DELETE SCHEDULE
 # ============================================================
 
@@ -1786,7 +1837,10 @@ async def delete_schedule(
 
         return
 
-    # Delete current scheduled messages
+    # --------------------------------------------------------
+    # DELETE CURRENT SCHEDULE MESSAGES
+    # --------------------------------------------------------
+
     for chat_id, message_id in row.get(
         "last_messages",
         {}
@@ -1798,11 +1852,19 @@ async def delete_schedule(
             int(message_id),
         )
 
+    # --------------------------------------------------------
+    # DELETE DATABASE RECORD
+    # --------------------------------------------------------
+
     await schedules_col.delete_one(
         {
             "_id": object_id
         }
     )
+
+    # --------------------------------------------------------
+    # REMOVE JOB
+    # --------------------------------------------------------
 
     for job in (
         context.application
@@ -2005,9 +2067,9 @@ def main():
         .build()
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # COMMANDS
-    # --------------------------------------------------------
+    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -2079,6 +2141,17 @@ def main():
         )
     )
 
+    # --------------------------------------------------------
+    # STOP ALL
+    # --------------------------------------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "stopall",
+            stop_all_schedules,
+        )
+    )
+
     application.add_handler(
         CommandHandler(
             "delete_schedule",
@@ -2093,9 +2166,9 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # AUTOMATIC CHAT REGISTRATION
-    # --------------------------------------------------------
+    # ========================================================
 
     application.add_handler(
         ChatMemberHandler(
@@ -2111,9 +2184,9 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # SETUP CONTENT
-    # --------------------------------------------------------
+    # ========================================================
 
     application.add_handler(
         MessageHandler(
@@ -2126,9 +2199,9 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # ERROR HANDLER
-    # --------------------------------------------------------
+    # ========================================================
 
     application.add_error_handler(
         error_handler
@@ -2138,9 +2211,9 @@ def main():
         "Starting promotion bot..."
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # ONLY ONE POLLING INSTANCE
-    # --------------------------------------------------------
+    # ========================================================
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
