@@ -7,9 +7,19 @@ from functools import wraps
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+
 from telegram.constants import ChatMemberStatus
-from telegram.error import RetryAfter, TimedOut, NetworkError
+
+from telegram.error import (
+    RetryAfter,
+    TimedOut,
+    NetworkError,
+)
 
 from telegram.ext import (
     Application,
@@ -49,11 +59,12 @@ ADMIN_IDS = {
 
 
 # ============================================================
-# SAFE RATE LIMITS
+# RATE LIMITS
 # ============================================================
 
 CHAT_SEND_DELAY = 1.2
 USER_SEND_DELAY = 1.5
+
 PROGRESS_EVERY = 10
 MAX_RETRIES = 3
 
@@ -105,6 +116,7 @@ def admin_only(func):
         if not user or not is_admin(user.id):
 
             if update.effective_message:
+
                 await update.effective_message.reply_text(
                     "⛔ Admin only."
                 )
@@ -122,43 +134,110 @@ def admin_only(func):
 
 def build_payload(setup):
 
+    buttons = setup.get("buttons")
+
+    if buttons is None:
+
+        # Compatibility with old single-button setup
+        old_text = setup.get("button_text")
+        old_url = setup.get("button_url")
+
+        buttons = []
+
+        if old_text and old_url:
+
+            buttons.append({
+                "text": old_text,
+                "url": old_url,
+                "style": "primary",
+            })
+
     return {
         "photo_file_id": setup.get("photo_file_id"),
         "text": setup.get("text") or "",
-        "button_text": setup.get("button_text"),
-        "button_url": setup.get("button_url"),
+        "buttons": buttons[:3],
     }
 
 
+# ============================================================
+# BUILD COLORED MULTI BUTTON KEYBOARD
+# ============================================================
+
 def build_keyboard(payload):
 
-    button_text = payload.get("button_text")
-    button_url = payload.get("button_url")
+    buttons = payload.get("buttons") or []
 
-    if button_text and button_url:
+    if not buttons:
+        return None
 
-        return InlineKeyboardMarkup(
-            [[
-                InlineKeyboardButton(
-                    button_text,
-                    url=button_url
-                )
-            ]]
-        )
+    keyboard = []
 
-    return None
+    for button in buttons[:3]:
+
+        button_text = (
+            button.get("text") or ""
+        ).strip()
+
+        button_url = (
+            button.get("url") or ""
+        ).strip()
+
+        button_style = (
+            button.get("style")
+            or "primary"
+        ).lower().strip()
+
+        if not button_text or not button_url:
+            continue
+
+        # ----------------------------------------------------
+        # Allowed Telegram styles
+        # ----------------------------------------------------
+
+        if button_style not in (
+            "primary",
+            "success",
+            "danger",
+        ):
+            button_style = "primary"
+
+        keyboard.append([
+            InlineKeyboardButton(
+                text=button_text[:64],
+                url=button_url,
+                style=button_style,
+            )
+        ])
+
+    if not keyboard:
+        return None
+
+    return InlineKeyboardMarkup(keyboard)
 
 
 # ============================================================
 # SEND PAYLOAD
 # ============================================================
 
-async def send_payload(bot, chat_id, payload):
+async def send_payload(
+    bot,
+    chat_id,
+    payload,
+):
 
     keyboard = build_keyboard(payload)
 
-    photo_id = payload.get("photo_file_id")
-    text = payload.get("text") or ""
+    photo_id = payload.get(
+        "photo_file_id"
+    )
+
+    text = payload.get(
+        "text"
+    ) or ""
+
+    # --------------------------------------------------------
+    # PHOTO
+    # --------------------------------------------------------
 
     if photo_id:
 
@@ -168,6 +247,10 @@ async def send_payload(bot, chat_id, payload):
             caption=text[:1024] if text else None,
             reply_markup=keyboard,
         )
+
+    # --------------------------------------------------------
+    # TEXT
+    # --------------------------------------------------------
 
     if not text:
         text = " "
@@ -198,11 +281,16 @@ async def register_chat(chat):
     try:
 
         await chats_col.update_one(
-            {"chat_id": chat.id},
+            {
+                "chat_id": chat.id
+            },
             {
                 "$set": {
                     "chat_id": chat.id,
-                    "title": chat.title or str(chat.id),
+                    "title": (
+                        chat.title
+                        or str(chat.id)
+                    ),
                     "type": chat.type,
                     "enabled": True,
                     "updated_at": now(),
@@ -230,7 +318,7 @@ async def register_chat(chat):
 
 
 # ============================================================
-# BOT ADDED / REMOVED FROM CHAT
+# BOT ADDED / REMOVED
 # ============================================================
 
 async def my_chat_member_update(
@@ -248,7 +336,9 @@ async def my_chat_member_update(
     if not member_update:
         return
 
-    new_status = member_update.new_chat_member.status
+    new_status = (
+        member_update.new_chat_member.status
+    )
 
     log.info(
         "MY CHAT MEMBER UPDATE | chat=%s | status=%s",
@@ -303,7 +393,9 @@ async def my_chat_member_update(
         try:
 
             await chats_col.update_one(
-                {"chat_id": chat.id},
+                {
+                    "chat_id": chat.id
+                },
                 {
                     "$set": {
                         "enabled": False,
@@ -357,13 +449,17 @@ async def start(
         return
 
     existing = await users_col.find_one(
-        {"user_id": user.id}
+        {
+            "user_id": user.id
+        }
     )
 
     if existing:
 
         await users_col.update_one(
-            {"user_id": user.id},
+            {
+                "user_id": user.id
+            },
             {
                 "$set": {
                     "name": user.full_name,
@@ -485,7 +581,7 @@ async def help_command(
     await update.effective_message.reply_text(
         "🔥 PROMOTION BOT\n\n"
 
-        "👥 USER\n"
+        "👥 USERS\n"
         "/users\n"
         "/ubroadcast\n\n"
 
@@ -498,15 +594,23 @@ async def help_command(
         "/pause ID\n"
         "/resume ID\n"
         "/stopall\n"
-        "/delete_schedule ID\n\n"
+        "/delete_schedule ID\n"
+        "/deleteall\n\n"
 
         "📊 CHATS\n"
         "/chats\n\n"
 
         "❌ /cancel\n\n"
 
-        "ℹ️ /addchat is NOT required.\n"
-        "Groups/channels are registered automatically."
+        "🎨 BUTTON FORMAT\n"
+        "Button | URL | color\n\n"
+
+        "Available colors:\n"
+        "🔵 primary\n"
+        "🟢 success\n"
+        "🔴 danger\n\n"
+
+        "Maximum 3 buttons."
     )
 
 
@@ -525,16 +629,18 @@ async def begin_setup(
         "step": "content",
         "photo_file_id": None,
         "text": "",
-        "button_text": None,
-        "button_url": None,
+        "buttons": [],
     }
 
     await update.effective_message.reply_text(
         f"🚀 {mode.upper()} SETUP\n\n"
+
         "🖼️ Send a photo with caption\n"
         "OR\n"
         "📝 Send text\n\n"
-        "Then button setup will appear.\n\n"
+
+        "Then 3-button setup will appear.\n\n"
+
         "/cancel to cancel."
     )
 
@@ -599,7 +705,9 @@ async def capture_content(
     context,
 ):
 
-    setup = context.user_data.get("setup")
+    setup = context.user_data.get(
+        "setup"
+    )
 
     if not setup:
         return
@@ -631,16 +739,31 @@ async def capture_content(
     setup["step"] = "button"
 
     await message.reply_text(
-        "🔘 BUTTON\n\n"
-        "Send:\n\n"
-        "Button Text | https://example.com\n\n"
-        "OR\n"
+        "🎨 MULTI BUTTON SETUP\n\n"
+
+        "Maximum 3 buttons.\n\n"
+
+        "Format:\n"
+        "Button Text | URL | Color\n\n"
+
+        "Example:\n\n"
+
+        "🎬 Watch Video | https://example.com | primary\n"
+        "👥 Join Group | https://t.me/group | success\n"
+        "📢 Join Channel | https://t.me/channel | danger\n\n"
+
+        "Colors:\n"
+        "🔵 primary = Blue\n"
+        "🟢 success = Green\n"
+        "🔴 danger = Red\n\n"
+
+        "Or send:\n"
         "skip"
     )
 
 
 # ============================================================
-# CAPTURE BUTTON
+# CAPTURE BUTTONS
 # ============================================================
 
 async def capture_button(
@@ -648,7 +771,9 @@ async def capture_button(
     context,
 ):
 
-    setup = context.user_data.get("setup")
+    setup = context.user_data.get(
+        "setup"
+    )
 
     if not setup:
         return
@@ -657,56 +782,142 @@ async def capture_button(
         return
 
     text = (
-        update.effective_message.text or ""
+        update.effective_message.text
+        or ""
     ).strip()
+
+    # --------------------------------------------------------
+    # NO BUTTONS
+    # --------------------------------------------------------
 
     if text.lower() == "skip":
 
-        setup["button_text"] = None
-        setup["button_url"] = None
+        setup["buttons"] = []
 
     else:
 
-        if "|" not in text:
+        lines = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip()
+        ]
+
+        if len(lines) > 3:
 
             await update.effective_message.reply_text(
-                "❌ Correct format:\n\n"
-                "Button Text | https://example.com"
+                "❌ Maximum 3 buttons മാത്രം."
             )
 
             return
 
-        button_text, button_url = (
-            x.strip()
-            for x in text.split("|", 1)
-        )
+        buttons = []
 
-        if not (
-            button_url.startswith("https://")
-            or button_url.startswith("http://")
-            or button_url.startswith("tg://")
-        ):
+        for line in lines:
 
-            await update.effective_message.reply_text(
-                "❌ Invalid URL."
+            parts = [
+                x.strip()
+                for x in line.split("|")
+            ]
+
+            # ------------------------------------------------
+            # Text | URL
+            # ------------------------------------------------
+
+            if len(parts) == 2:
+
+                button_text = parts[0]
+                button_url = parts[1]
+                button_style = "primary"
+
+            # ------------------------------------------------
+            # Text | URL | Color
+            # ------------------------------------------------
+
+            elif len(parts) == 3:
+
+                button_text = parts[0]
+                button_url = parts[1]
+                button_style = (
+                    parts[2].lower()
+                )
+
+            else:
+
+                await update.effective_message.reply_text(
+                    "❌ Invalid format.\n\n"
+                    "Use:\n"
+                    "Button Text | URL | Color"
+                )
+
+                return
+
+            # ------------------------------------------------
+            # BUTTON TEXT
+            # ------------------------------------------------
+
+            if not button_text:
+
+                await update.effective_message.reply_text(
+                    "❌ Button text cannot be empty."
+                )
+
+                return
+
+            # ------------------------------------------------
+            # URL
+            # ------------------------------------------------
+
+            if not (
+                button_url.startswith(
+                    "https://"
+                )
+                or button_url.startswith(
+                    "http://"
+                )
+                or button_url.startswith(
+                    "tg://"
+                )
+            ):
+
+                await update.effective_message.reply_text(
+                    f"❌ Invalid URL:\n{button_url}"
+                )
+
+                return
+
+            # ------------------------------------------------
+            # COLOR
+            # ------------------------------------------------
+
+            if button_style not in (
+                "primary",
+                "success",
+                "danger",
+            ):
+
+                await update.effective_message.reply_text(
+                    "❌ Invalid color.\n\n"
+                    "Use only:\n"
+                    "primary\n"
+                    "success\n"
+                    "danger"
+                )
+
+                return
+
+            buttons.append(
+                {
+                    "text": button_text[:64],
+                    "url": button_url,
+                    "style": button_style,
+                }
             )
 
-            return
+        setup["buttons"] = buttons
 
-        if not button_text:
-
-            await update.effective_message.reply_text(
-                "❌ Button text cannot be empty."
-            )
-
-            return
-
-        setup["button_text"] = button_text[:64]
-        setup["button_url"] = button_url
-
-    # --------------------------------------------------------
+    # ========================================================
     # NORMAL BROADCAST
-    # --------------------------------------------------------
+    # ========================================================
 
     if setup["mode"] == "broadcast":
 
@@ -717,9 +928,9 @@ async def capture_button(
 
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # USER BROADCAST
-    # --------------------------------------------------------
+    # ========================================================
 
     if setup["mode"] == "ubroadcast":
 
@@ -730,9 +941,9 @@ async def capture_button(
 
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # SCHEDULE
-    # --------------------------------------------------------
+    # ========================================================
 
     if setup["mode"] == "schedule":
 
@@ -740,17 +951,20 @@ async def capture_button(
 
         await update.effective_message.reply_text(
             "⏱️ SELECT INTERVAL\n\n"
+
             "5m\n"
             "10m\n"
             "15m\n"
             "30m\n"
             "1h\n\n"
-            "Example: 10m"
+
+            "Example:\n"
+            "10m"
         )
 
 
 # ============================================================
-# CHAT BROADCAST SAFE SEND
+# SAFE CHAT SEND
 # ============================================================
 
 async def safe_chat_send(
@@ -782,12 +996,14 @@ async def safe_chat_send(
             ) + 2
 
             log.warning(
-                "FloodWait/RetryAfter chat=%s wait=%ss",
+                "RetryAfter chat=%s wait=%ss",
                 chat_id,
                 wait,
             )
 
-            await asyncio.sleep(wait)
+            await asyncio.sleep(
+                wait
+            )
 
         except (
             TimedOut,
@@ -815,9 +1031,13 @@ async def execute_chat_broadcast(
     context,
 ):
 
-    setup = context.user_data.get("setup")
+    setup = context.user_data.get(
+        "setup"
+    )
 
-    payload = build_payload(setup)
+    payload = build_payload(
+        setup
+    )
 
     rows = await chats_col.find(
         {
@@ -926,7 +1146,7 @@ async def execute_chat_broadcast(
 
 
 # ============================================================
-# USER SAFE SEND
+# SAFE USER SEND
 # ============================================================
 
 async def safe_user_send(
@@ -987,9 +1207,13 @@ async def execute_user_broadcast(
     context,
 ):
 
-    setup = context.user_data.get("setup")
+    setup = context.user_data.get(
+        "setup"
+    )
 
-    payload = build_payload(setup)
+    payload = build_payload(
+        setup
+    )
 
     total = await users_col.count_documents(
         {
@@ -1150,7 +1374,9 @@ async def capture_interval(
     context,
 ):
 
-    setup = context.user_data.get("setup")
+    setup = context.user_data.get(
+        "setup"
+    )
 
     if not setup:
         return
@@ -1159,14 +1385,15 @@ async def capture_interval(
         return
 
     value = (
-        update.effective_message.text or ""
+        update.effective_message.text
+        or ""
     ).strip().lower()
 
     if value not in INTERVALS:
 
         await update.effective_message.reply_text(
             "❌ Invalid interval.\n\n"
-            "Choose one:\n"
+            "Choose:\n"
             "5m\n"
             "10m\n"
             "15m\n"
@@ -1176,7 +1403,9 @@ async def capture_interval(
 
         return
 
-    payload = build_payload(setup)
+    payload = build_payload(
+        setup
+    )
 
     doc = {
         "interval": INTERVALS[value],
@@ -1228,15 +1457,22 @@ async def capture_interval(
         "✅ SCHEDULE CREATED\n\n"
         f"🆔 {schedule_id}\n"
         f"⏱ Every {value}\n\n"
-        "🔄 Previous scheduled message will be deleted.\n"
+
+        "🔄 Previous scheduled message "
+        "will be deleted.\n"
+
         "🆕 New promotion will be sent.\n\n"
-        "Works automatically for all "
-        "registered groups/channels."
+
+        "📢 Works automatically for all "
+        "registered groups/channels.\n\n"
+
+        "🗑 To delete this schedule:\n"
+        f"/delete_schedule {schedule_id}"
     )
 
 
 # ============================================================
-# DELETE OLD MESSAGE
+# DELETE MESSAGE SAFE
 # ============================================================
 
 async def delete_message_safe(
@@ -1246,28 +1482,11 @@ async def delete_message_safe(
 ):
 
     if not message_id:
-        return
+        return False
 
-    try:
-
-        await bot.delete_message(
-            chat_id=chat_id,
-            message_id=message_id,
-        )
-
-    except RetryAfter as e:
-
-        wait = int(
-            getattr(
-                e,
-                "retry_after",
-                1,
-            )
-        ) + 2
-
-        await asyncio.sleep(
-            wait
-        )
+    for attempt in range(
+        MAX_RETRIES + 1
+    ):
 
         try:
 
@@ -1276,11 +1495,39 @@ async def delete_message_safe(
                 message_id=message_id,
             )
 
-        except Exception:
-            pass
+            return True
 
-    except Exception:
-        pass
+        except RetryAfter as e:
+
+            wait = int(
+                getattr(
+                    e,
+                    "retry_after",
+                    1,
+                )
+            ) + 2
+
+            await asyncio.sleep(
+                wait
+            )
+
+        except (
+            TimedOut,
+            NetworkError,
+        ):
+
+            if attempt >= MAX_RETRIES:
+                return False
+
+            await asyncio.sleep(
+                2 ** attempt
+            )
+
+        except Exception:
+
+            return False
+
+    return False
 
 
 # ============================================================
@@ -1317,7 +1564,10 @@ async def run_schedule(
     if not doc:
         return
 
-    payload = doc["payload"]
+    payload = doc.get(
+        "payload",
+        {}
+    )
 
     rows = await chats_col.find(
         {
@@ -1341,10 +1591,12 @@ async def run_schedule(
         key = str(chat_id)
 
         # ----------------------------------------------------
-        # DELETE PREVIOUS SCHEDULE MESSAGE
+        # DELETE PREVIOUS MESSAGE
         # ----------------------------------------------------
 
-        old_message_id = old_messages.get(key)
+        old_message_id = old_messages.get(
+            key
+        )
 
         if old_message_id:
 
@@ -1360,7 +1612,7 @@ async def run_schedule(
 
         try:
 
-            message = await send_payload(
+            message = await safe_chat_send(
                 application.bot,
                 chat_id,
                 payload,
@@ -1369,46 +1621,6 @@ async def run_schedule(
             new_messages[key] = (
                 message.message_id
             )
-
-        except RetryAfter as e:
-
-            wait = int(
-                getattr(
-                    e,
-                    "retry_after",
-                    1,
-                )
-            ) + 2
-
-            log.warning(
-                "Schedule RetryAfter chat=%s wait=%ss",
-                chat_id,
-                wait,
-            )
-
-            await asyncio.sleep(
-                wait
-            )
-
-            try:
-
-                message = await send_payload(
-                    application.bot,
-                    chat_id,
-                    payload,
-                )
-
-                new_messages[key] = (
-                    message.message_id
-                )
-
-            except Exception as retry_error:
-
-                log.warning(
-                    "Schedule retry failed %s: %s",
-                    chat_id,
-                    retry_error,
-                )
 
         except Exception as e:
 
@@ -1443,7 +1655,9 @@ async def scheduled_job(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    job_data = context.job.data or {}
+    job_data = (
+        context.job.data or {}
+    )
 
     schedule_id = job_data.get(
         "schedule_id"
@@ -1572,7 +1786,7 @@ async def schedules(
 
 
 # ============================================================
-# PAUSE ONE SCHEDULE
+# PAUSE
 # ============================================================
 
 @admin_only
@@ -1641,7 +1855,7 @@ async def pause(
 
 
 # ============================================================
-# RESUME ONE SCHEDULE
+# RESUME
 # ============================================================
 
 @admin_only
@@ -1737,10 +1951,6 @@ async def stop_all_schedules(
     context,
 ):
 
-    # --------------------------------------------------------
-    # STOP ALL ACTIVE SCHEDULES IN DATABASE
-    # --------------------------------------------------------
-
     result = await schedules_col.update_many(
         {
             "enabled": True
@@ -1753,25 +1963,29 @@ async def stop_all_schedules(
         },
     )
 
-    # --------------------------------------------------------
-    # REMOVE ALL SCHEDULE JOBS
-    # --------------------------------------------------------
-
     removed_jobs = 0
 
-    for job in context.application.job_queue.jobs():
+    for job in (
+        context.application
+        .job_queue
+        .jobs()
+    ):
 
-        if job.name and job.name.startswith("schedule:"):
+        if (
+            job.name
+            and job.name.startswith(
+                "schedule:"
+            )
+        ):
 
             job.schedule_removal()
 
             removed_jobs += 1
 
-    # --------------------------------------------------------
-    # RESULT
-    # --------------------------------------------------------
-
-    if result.modified_count == 0 and removed_jobs == 0:
+    if (
+        result.modified_count == 0
+        and removed_jobs == 0
+    ):
 
         await update.effective_message.reply_text(
             "ℹ️ NO ACTIVE SCHEDULES\n\n"
@@ -1790,7 +2004,7 @@ async def stop_all_schedules(
 
 
 # ============================================================
-# DELETE SCHEDULE
+# DELETE ONE SCHEDULE
 # ============================================================
 
 @admin_only
@@ -1837,8 +2051,11 @@ async def delete_schedule(
 
         return
 
+    deleted = 0
+    failed = 0
+
     # --------------------------------------------------------
-    # DELETE CURRENT SCHEDULE MESSAGES
+    # DELETE ALL CURRENT MESSAGES OF THIS SCHEDULE
     # --------------------------------------------------------
 
     for chat_id, message_id in row.get(
@@ -1846,21 +2063,16 @@ async def delete_schedule(
         {}
     ).items():
 
-        await delete_message_safe(
+        result = await delete_message_safe(
             context.bot,
             int(chat_id),
             int(message_id),
         )
 
-    # --------------------------------------------------------
-    # DELETE DATABASE RECORD
-    # --------------------------------------------------------
-
-    await schedules_col.delete_one(
-        {
-            "_id": object_id
-        }
-    )
+        if result:
+            deleted += 1
+        else:
+            failed += 1
 
     # --------------------------------------------------------
     # REMOVE JOB
@@ -1876,8 +2088,107 @@ async def delete_schedule(
 
         job.schedule_removal()
 
+    # --------------------------------------------------------
+    # DELETE DATABASE RECORD
+    # --------------------------------------------------------
+
+    await schedules_col.delete_one(
+        {
+            "_id": object_id
+        }
+    )
+
     await update.effective_message.reply_text(
-        "🗑 Schedule deleted."
+        "🗑 SCHEDULE DELETED\n\n"
+        f"🆔 {sid}\n"
+        f"✅ Messages deleted: {deleted}\n"
+        f"❌ Failed: {failed}\n\n"
+        "💾 Schedule record removed."
+    )
+
+
+# ============================================================
+# DELETE ALL SCHEDULE MESSAGES
+# ============================================================
+
+@admin_only
+async def delete_all_schedule_messages(
+    update,
+    context,
+):
+
+    rows = await schedules_col.find(
+        {}
+    ).to_list(
+        length=1000
+    )
+
+    if not rows:
+
+        await update.effective_message.reply_text(
+            "ℹ️ No schedules found."
+        )
+
+        return
+
+    total_messages = 0
+    deleted = 0
+    failed = 0
+
+    # --------------------------------------------------------
+    # DELETE CURRENT MESSAGE OF EVERY SCHEDULE
+    # --------------------------------------------------------
+
+    for row in rows:
+
+        last_messages = row.get(
+            "last_messages",
+            {}
+        )
+
+        total_messages += len(
+            last_messages
+        )
+
+        for chat_id, message_id in (
+            last_messages.items()
+        ):
+
+            result = await delete_message_safe(
+                context.bot,
+                int(chat_id),
+                int(message_id),
+            )
+
+            if result:
+                deleted += 1
+            else:
+                failed += 1
+
+        # ----------------------------------------------------
+        # CLEAR SAVED MESSAGE IDS
+        # ----------------------------------------------------
+
+        await schedules_col.update_one(
+            {
+                "_id": row["_id"]
+            },
+            {
+                "$set": {
+                    "last_messages": {},
+                    "updated_at": now(),
+                }
+            },
+        )
+
+    await update.effective_message.reply_text(
+        "🧹 ALL SCHEDULE MESSAGES PROCESSED\n\n"
+        f"📦 Tracked messages: {total_messages}\n"
+        f"✅ Deleted: {deleted}\n"
+        f"❌ Failed: {failed}\n\n"
+        "💾 Schedule settings are still saved.\n\n"
+        "⚠️ Active schedules will send a new "
+        "message again at their next interval."
     )
 
 
@@ -1893,7 +2204,7 @@ async def cancel(
 
     context.user_data.pop(
         "setup",
-        None
+        None,
     )
 
     await update.effective_message.reply_text(
@@ -2141,10 +2452,6 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # STOP ALL
-    # --------------------------------------------------------
-
     application.add_handler(
         CommandHandler(
             "stopall",
@@ -2156,6 +2463,17 @@ def main():
         CommandHandler(
             "delete_schedule",
             delete_schedule,
+        )
+    )
+
+    # --------------------------------------------------------
+    # DELETE ALL CURRENT SCHEDULE MESSAGES
+    # --------------------------------------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "deleteall",
+            delete_all_schedule_messages,
         )
     )
 
@@ -2212,7 +2530,7 @@ def main():
     )
 
     # ========================================================
-    # ONLY ONE POLLING INSTANCE
+    # ONE POLLING INSTANCE
     # ========================================================
 
     application.run_polling(
