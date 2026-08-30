@@ -27,6 +27,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ChatMemberHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -130,7 +131,23 @@ def admin_only(func):
 
 
 # ============================================================
-# PAYLOAD
+# URL VALIDATION
+# ============================================================
+
+def valid_url(url: str) -> bool:
+
+    if not url:
+        return False
+
+    return (
+        url.startswith("https://")
+        or url.startswith("http://")
+        or url.startswith("tg://")
+    )
+
+
+# ============================================================
+# BUILD PAYLOAD
 # ============================================================
 
 def build_payload(setup):
@@ -160,7 +177,7 @@ def build_payload(setup):
 
 
 # ============================================================
-# KEYBOARD
+# BUILD KEYBOARD
 # ============================================================
 
 def build_keyboard(payload):
@@ -290,6 +307,13 @@ async def register_chat(chat):
             upsert=True,
         )
 
+        log.info(
+            "CHAT REGISTERED: %s | %s | %s",
+            chat.title,
+            chat.type,
+            chat.id,
+        )
+
     except Exception as e:
 
         log.error(
@@ -384,9 +408,14 @@ async def my_chat_member_update(
                 e,
             )
 
+        log.info(
+            "BOT REMOVED: %s",
+            chat.id,
+        )
+
 
 # ============================================================
-# CHAT MEMBER
+# CHAT MEMBER UPDATE
 # ============================================================
 
 async def chat_member_update(
@@ -537,7 +566,55 @@ async def chats(
 
 
 # ============================================================
-# HELP - ADMIN ONLY
+# ADMIN PANEL KEYBOARD
+# ============================================================
+
+def admin_panel_keyboard():
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📊 Users",
+                callback_data="admin_users",
+            ),
+            InlineKeyboardButton(
+                "💬 Chats",
+                callback_data="admin_chats",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🎨 5 Button Sets",
+                callback_data="admin_sets",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔄 Schedules",
+                callback_data="admin_schedules",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📢 Broadcast",
+                callback_data="admin_broadcast",
+            ),
+            InlineKeyboardButton(
+                "👥 User Broadcast",
+                callback_data="admin_ubroadcast",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ Close",
+                callback_data="admin_close",
+            ),
+        ],
+    ])
+
+
+# ============================================================
+# HELP
 # ============================================================
 
 @admin_only
@@ -565,9 +642,9 @@ async def help_command(
         "/delete_schedule ID\n"
         "/deleteall\n\n"
 
-        "🎯 PROMOTION SETS\n"
+        "🎨 PROMOTION SETS\n"
         "/sets\n"
-        "/setstatus\n"
+        "/setlinks\n"
         "/clearsets\n\n"
 
         "📊 CHATS\n"
@@ -575,366 +652,188 @@ async def help_command(
 
         "❌ /cancel\n\n"
 
-        "━━━━━━━━━━━━━━\n"
-        "🎨 BUTTON COLOURS\n"
-        "━━━━━━━━━━━━━━\n\n"
+        "━━━━━━━━━━━━━━━━\n\n"
 
-        "primary = 🔵 Blue\n"
-        "success = 🟢 Green\n"
-        "danger = 🔴 Red\n\n"
-
-        "Maximum 3 buttons per set."
-    )
-
-
-# ============================================================
-# SET SYSTEM
-#
-# 15 LINKS
-# ↓
-# 5 SETS
-# ↓
-# 3 BUTTONS PER SET
-# ============================================================
-
-async def get_promotion_sets():
-
-    doc = await sets_col.find_one(
-        {
-            "_id": "main"
-        }
-    )
-
-    if not doc:
-        return []
-
-    return doc.get(
-        "sets",
-        []
-    )
-
-
-# ============================================================
-# /sets
-# ============================================================
-
-@admin_only
-async def promotion_sets(
-    update,
-    context,
-):
-
-    context.user_data["set_setup"] = {
-        "step": "waiting_lines"
-    }
-
-    await update.effective_message.reply_text(
-        "🎯 PROMOTION SETUP\n\n"
-
-        "15 പേരും 15 ലിങ്കും ഇവിടെ അയക്കുക.\n\n"
-
-        "ഓരോ line-ലും:\n"
-        "പേര് | ലിങ്ക്\n\n"
-
-        "Example:\n\n"
-
-        "Person 1 | https://t.me/link1\n"
-        "Person 2 | https://t.me/link2\n"
-        "Person 3 | https://t.me/link3\n"
-        "Person 4 | https://t.me/link4\n"
-        "...\n"
-        "Person 15 | https://t.me/link15\n\n"
-
-        "🎨 Color വേണമെങ്കിൽ:\n"
-        "പേര് | ലിങ്ക് | primary\n\n"
-
-        "Colors:\n"
+        "🎨 BUTTON COLORS\n"
         "🔵 primary\n"
         "🟢 success\n"
         "🔴 danger\n\n"
 
-        "⚠️ Exactly 15 lines വേണം.\n\n"
-        "/cancel — cancel"
+        "📦 5 SETS\n"
+        "Set 1 → 3 buttons\n"
+        "Set 2 → 3 buttons\n"
+        "Set 3 → 3 buttons\n"
+        "Set 4 → 3 buttons\n"
+        "Set 5 → 3 buttons\n\n"
+
+        "📌 Total = 15 names + 15 links\n\n"
+
+        "🔄 Schedule ഓരോ run-ലും ഒരു set മാറും.\n"
+        "Random rotation ഉപയോഗിക്കും.\n"
+        "ഒരു cycle-ൽ same set വീണ്ടും വരില്ല.",
+        reply_markup=admin_panel_keyboard(),
     )
 
 
 # ============================================================
-# SAVE 15 LINKS
+# ADMIN CALLBACK
 # ============================================================
 
-async def capture_promotion_sets(
-    update,
-    context,
+async def admin_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    state = context.user_data.get(
-        "set_setup"
-    )
+    query = update.callback_query
 
-    if not state:
+    if not query:
         return
 
-    if state.get("step") != "waiting_lines":
-        return
+    user = query.from_user
 
-    message = update.effective_message
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # NORMAL USERS CANNOT USE ADMIN BUTTONS
+    # --------------------------------------------------------
 
-    if not message or not message.text:
-        return
+    if not is_admin(user.id):
 
-    text = message.text.strip()
-
-    if text.lower() == "/cancel":
-
-        context.user_data.pop(
-            "set_setup",
-            None,
+        await query.answer(
+            "⛔ Admin only.",
+            show_alert=True,
         )
 
         return
 
-    lines = [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip()
-    ]
+    await query.answer()
 
-    # --------------------------------------------------------
-    # EXACTLY 15
-    # --------------------------------------------------------
+    data = query.data
 
-    if len(lines) != 15:
+    if data == "admin_close":
 
-        await message.reply_text(
-            "❌ Exactly 15 lines വേണം.\n\n"
-            f"നിങ്ങൾ അയച്ചത്: {len(lines)}\n\n"
-            "Example:\n"
-            "Name 1 | https://t.me/link1\n"
-            "Name 2 | https://t.me/link2\n"
-            "...\n"
-            "Name 15 | https://t.me/link15"
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        return
+
+    if data == "admin_users":
+
+        total = await users_col.count_documents({})
+
+        active = await users_col.count_documents(
+            {
+                "blocked": {
+                    "$ne": True
+                }
+            }
+        )
+
+        blocked = await users_col.count_documents(
+            {
+                "blocked": True
+            }
+        )
+
+        await query.message.reply_text(
+            "👥 USER STATISTICS\n\n"
+            f"📊 Total: {total}\n"
+            f"🟢 Active: {active}\n"
+            f"🔴 Blocked: {blocked}"
         )
 
         return
 
-    buttons = []
+    if data == "admin_chats":
 
-    for index, line in enumerate(
-        lines,
-        start=1,
-    ):
+        total = await chats_col.count_documents({})
 
-        parts = [
-            x.strip()
-            for x in line.split("|")
+        active = await chats_col.count_documents(
+            {
+                "enabled": True
+            }
+        )
+
+        await query.message.reply_text(
+            "💬 CHAT STATISTICS\n\n"
+            f"📦 Total Records: {total}\n"
+            f"🟢 Active: {active}"
+        )
+
+        return
+
+    if data == "admin_sets":
+
+        await show_sets(
+            query.message,
+            context,
+        )
+
+        return
+
+    if data == "admin_schedules":
+
+        rows = await schedules_col.find().sort(
+            "created_at",
+            -1,
+        ).to_list(
+            length=100
+        )
+
+        if not rows:
+
+            await query.message.reply_text(
+                "❌ No schedules."
+            )
+
+            return
+
+        lines = [
+            "🔄 SCHEDULES\n"
         ]
 
-        if len(parts) == 2:
+        for row in rows:
 
-            button_text = parts[0]
-            button_url = parts[1]
-            style = "primary"
+            sid = str(row["_id"])
 
-        elif len(parts) == 3:
-
-            button_text = parts[0]
-            button_url = parts[1]
-            style = parts[2].lower()
-
-        else:
-
-            await message.reply_text(
-                f"❌ Line {index} invalid.\n\n"
-                "Format:\n"
-                "Name | URL | Color"
+            status = (
+                "🟢 ON"
+                if row.get("enabled")
+                else "⏸ OFF"
             )
 
-            return
-
-        if not button_text:
-
-            await message.reply_text(
-                f"❌ Line {index}: Name missing."
+            lines.append(
+                f"{status}\n"
+                f"🆔 {sid}\n"
+                f"⏱ Every {row.get('interval_label', '-')}\n"
             )
 
-            return
-
-        if not (
-            button_url.startswith("https://")
-            or button_url.startswith("http://")
-            or button_url.startswith("tg://")
-        ):
-
-            await message.reply_text(
-                f"❌ Line {index}: Invalid URL.\n\n"
-                f"{button_url}"
-            )
-
-            return
-
-        if style not in (
-            "primary",
-            "success",
-            "danger",
-        ):
-
-            await message.reply_text(
-                f"❌ Line {index}: Invalid colour.\n\n"
-                "Use:\n"
-                "primary\n"
-                "success\n"
-                "danger"
-            )
-
-            return
-
-        buttons.append(
-            {
-                "text": button_text[:64],
-                "url": button_url,
-                "style": style,
-            }
-        )
-
-    # --------------------------------------------------------
-    # AUTOMATIC 5 SETS
-    # --------------------------------------------------------
-
-    promotion_sets_data = []
-
-    for i in range(5):
-
-        start = i * 3
-        end = start + 3
-
-        promotion_sets_data.append(
-            {
-                "set_number": i + 1,
-                "buttons": buttons[start:end],
-            }
-        )
-
-    # --------------------------------------------------------
-    # SAVE
-    # --------------------------------------------------------
-
-    await sets_col.update_one(
-        {
-            "_id": "main"
-        },
-        {
-            "$set": {
-                "sets": promotion_sets_data,
-                "total_links": 15,
-                "total_sets": 5,
-                "updated_at": now(),
-            },
-            "$setOnInsert": {
-                "created_at": now(),
-            },
-        },
-        upsert=True,
-    )
-
-    context.user_data.pop(
-        "set_setup",
-        None,
-    )
-
-    await message.reply_text(
-        "✅ PROMOTION SETS SAVED\n\n"
-
-        "📦 Total links: 15\n"
-        "🎯 Total sets: 5\n"
-        "🔘 Buttons per set: 3\n\n"
-
-        "SET 1 → Link 1–3\n"
-        "SET 2 → Link 4–6\n"
-        "SET 3 → Link 7–9\n"
-        "SET 4 → Link 10–12\n"
-        "SET 5 → Link 13–15\n\n"
-
-        "🔄 Schedule ഓടുമ്പോൾ sets "
-        "മാറിമാറി പോകും.\n\n"
-
-        "📌 /setstatus"
-    )
-
-
-# ============================================================
-# SET STATUS
-# ============================================================
-
-@admin_only
-async def set_status(
-    update,
-    context,
-):
-
-    sets = await get_promotion_sets()
-
-    if not sets:
-
-        await update.effective_message.reply_text(
-            "❌ Promotion sets ഇതുവരെ set ചെയ്തിട്ടില്ല.\n\n"
-            "Use /sets"
+        await query.message.reply_text(
+            "\n".join(lines)
         )
 
         return
 
-    text = (
-        "🎯 PROMOTION SET STATUS\n\n"
-        "━━━━━━━━━━━━━━\n"
-    )
+    if data == "admin_broadcast":
 
-    for item in sets:
-
-        number = item.get(
-            "set_number"
+        await begin_setup(
+            query.message,
+            context,
+            "broadcast",
         )
 
-        text += (
-            f"📦 SET {number}\n"
+        return
+
+    if data == "admin_ubroadcast":
+
+        await begin_setup(
+            query.message,
+            context,
+            "ubroadcast",
         )
 
-        for button in item.get(
-            "buttons",
-            []
-        ):
-
-            text += (
-                f"🔘 {button.get('text')}\n"
-                f"🔗 {button.get('url')}\n"
-                f"🎨 {button.get('style')}\n\n"
-            )
-
-        text += "━━━━━━━━━━━━━━\n"
-
-    await update.effective_message.reply_text(
-        text[:4096]
-    )
-
-
-# ============================================================
-# CLEAR SETS
-# ============================================================
-
-@admin_only
-async def clear_sets(
-    update,
-    context,
-):
-
-    await sets_col.delete_one(
-        {
-            "_id": "main"
-        }
-    )
-
-    await update.effective_message.reply_text(
-        "🗑 PROMOTION SETS CLEARED.\n\n"
-        "Use /sets to create them again."
-    )
+        return
 
 
 # ============================================================
@@ -1059,6 +958,36 @@ async def capture_content(
 
         return
 
+    # --------------------------------------------------------
+    # SCHEDULE USES THE SAVED 5 SETS
+    # --------------------------------------------------------
+
+    if setup["mode"] == "schedule":
+
+        setup["step"] = "interval"
+
+        await message.reply_text(
+            "⏱️ SELECT INTERVAL\n\n"
+
+            "5m\n"
+            "10m\n"
+            "15m\n"
+            "30m\n"
+            "1h\n\n"
+
+            "Example:\n"
+            "5m\n\n"
+
+            "🎨 The 5 saved button sets will "
+            "rotate automatically."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # NORMAL BROADCAST BUTTON SETUP
+    # --------------------------------------------------------
+
     setup["step"] = "button"
 
     await message.reply_text(
@@ -1071,9 +1000,14 @@ async def capture_content(
 
         "Example:\n\n"
 
-        "🎬 Watch | https://example.com | primary\n"
-        "👥 Join | https://t.me/group | success\n"
-        "📢 Channel | https://t.me/channel | danger\n\n"
+        "🎬 Watch Video | https://example.com | primary\n"
+        "👥 Join Group | https://t.me/group | success\n"
+        "📢 Join Channel | https://t.me/channel | danger\n\n"
+
+        "Colors:\n"
+        "🔵 primary\n"
+        "🟢 success\n"
+        "🔴 danger\n\n"
 
         "Or send:\n"
         "skip"
@@ -1162,11 +1096,7 @@ async def capture_button(
 
                 return
 
-            if not (
-                button_url.startswith("https://")
-                or button_url.startswith("http://")
-                or button_url.startswith("tg://")
-            ):
+            if not valid_url(button_url):
 
                 await update.effective_message.reply_text(
                     f"❌ Invalid URL:\n{button_url}"
@@ -1181,7 +1111,8 @@ async def capture_button(
             ):
 
                 await update.effective_message.reply_text(
-                    "❌ Invalid colour.\n\n"
+                    "❌ Invalid color.\n\n"
+                    "Use:\n"
                     "primary\n"
                     "success\n"
                     "danger"
@@ -1217,23 +1148,6 @@ async def capture_button(
 
         return
 
-    if setup["mode"] == "schedule":
-
-        setup["step"] = "interval"
-
-        await update.effective_message.reply_text(
-            "⏱️ SELECT INTERVAL\n\n"
-
-            "5m\n"
-            "10m\n"
-            "15m\n"
-            "30m\n"
-            "1h\n\n"
-
-            "Example:\n"
-            "5m"
-        )
-
 
 # ============================================================
 # SAFE CHAT SEND
@@ -1267,9 +1181,7 @@ async def safe_chat_send(
                 )
             ) + 2
 
-            await asyncio.sleep(
-                wait
-            )
+            await asyncio.sleep(wait)
 
         except (
             TimedOut,
@@ -1345,11 +1257,13 @@ async def execute_chat_broadcast(
         start=1,
     ):
 
+        chat_id = row["chat_id"]
+
         try:
 
             await safe_chat_send(
                 context.bot,
-                row["chat_id"],
+                chat_id,
                 payload,
             )
 
@@ -1360,7 +1274,8 @@ async def execute_chat_broadcast(
             failed += 1
 
             log.warning(
-                "Broadcast failed: %s",
+                "Broadcast failed chat=%s error=%s",
+                chat_id,
                 e,
             )
 
@@ -1439,9 +1354,7 @@ async def safe_user_send(
                 )
             ) + 2
 
-            await asyncio.sleep(
-                wait
-            )
+            await asyncio.sleep(wait)
 
         except (
             TimedOut,
@@ -1628,7 +1541,504 @@ INTERVALS = {
 
 
 # ============================================================
-# CREATE SCHEDULE
+# PROMOTION SETS
+#
+# 5 SETS
+# EACH SET = 3 BUTTONS
+# TOTAL = 15 BUTTONS
+# ============================================================
+
+SET_NUMBERS = [1, 2, 3, 4, 5]
+
+
+# ============================================================
+# GET SET
+# ============================================================
+
+async def get_promo_set(
+    set_no: int,
+):
+
+    return await sets_col.find_one(
+        {
+            "set_no": set_no
+        }
+    )
+
+
+# ============================================================
+# SAVE SET
+# ============================================================
+
+async def save_promo_set(
+    set_no: int,
+    buttons,
+):
+
+    await sets_col.update_one(
+        {
+            "set_no": set_no
+        },
+        {
+            "$set": {
+                "set_no": set_no,
+                "buttons": buttons[:3],
+                "updated_at": now(),
+            },
+            "$setOnInsert": {
+                "created_at": now(),
+            },
+        },
+        upsert=True,
+    )
+
+
+# ============================================================
+# SHOW SETS
+# ============================================================
+
+async def show_sets(
+    message,
+    context,
+):
+
+    lines = [
+        "🎨 PROMOTION BUTTON SETS",
+        "",
+    ]
+
+    complete = 0
+
+    for set_no in SET_NUMBERS:
+
+        row = await get_promo_set(
+            set_no
+        )
+
+        if not row or not row.get("buttons"):
+
+            lines.append(
+                f"❌ SET {set_no} — EMPTY"
+            )
+
+            continue
+
+        buttons = row.get(
+            "buttons",
+            []
+        )
+
+        if len(buttons) == 3:
+            complete += 1
+
+        lines.append(
+            f"✅ SET {set_no} — "
+            f"{len(buttons)}/3 BUTTONS"
+        )
+
+        for i, button in enumerate(
+            buttons,
+            start=1,
+        ):
+
+            lines.append(
+                f"   {i}. "
+                f"{button.get('text', '-')}"
+                f" → "
+                f"{button.get('url', '-')}"
+                f" [{button.get('style', 'primary')}]"
+            )
+
+        lines.append("")
+
+    lines.extend([
+        "━━━━━━━━━━━━━━━━",
+        f"📦 Completed Sets: {complete}/5",
+        "",
+        "📝 SET ALL 15 BUTTONS:",
+        "/setlinks",
+        "",
+        "🧹 CLEAR ALL:",
+        "/clearsets",
+    ])
+
+    await message.reply_text(
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# /SETS
+# ============================================================
+
+@admin_only
+async def sets_command(
+    update,
+    context,
+):
+
+    await show_sets(
+        update.effective_message,
+        context,
+    )
+
+
+# ============================================================
+# /SETLINKS
+#
+# ADMIN SENDS 15 LINES
+#
+# 1. Name | URL | Color
+# 2. Name | URL | Color
+# ...
+# 15. Name | URL | Color
+#
+# FIRST 3 = SET 1
+# NEXT 3 = SET 2
+# ...
+# LAST 3 = SET 5
+# ============================================================
+
+@admin_only
+async def setlinks_command(
+    update,
+    context,
+):
+
+    context.user_data["setlinks_mode"] = True
+
+    await update.effective_message.reply_text(
+        "🎨 SET 15 BUTTONS\n\n"
+
+        "15 lines അയക്കുക.\n\n"
+
+        "Format:\n"
+        "Name | URL | Color\n\n"
+
+        "Example:\n"
+        "Group 1 | https://t.me/group1 | primary\n"
+        "Group 2 | https://t.me/group2 | success\n"
+        "Group 3 | https://t.me/group3 | danger\n\n"
+
+        "ആകെ 15 lines.\n\n"
+
+        "📦 Lines 1-3   = SET 1\n"
+        "📦 Lines 4-6   = SET 2\n"
+        "📦 Lines 7-9   = SET 3\n"
+        "📦 Lines 10-12 = SET 4\n"
+        "📦 Lines 13-15 = SET 5\n\n"
+
+        "🔵 primary\n"
+        "🟢 success\n"
+        "🔴 danger\n\n"
+
+        "⚠️ ഓരോ Set-ലും 3 buttons വേണം.\n\n"
+
+        "/cancel ഉപയോഗിച്ച് cancel ചെയ്യാം."
+    )
+
+
+# ============================================================
+# CAPTURE 15 SET LINKS
+# ============================================================
+
+async def capture_setlinks(
+    update,
+    context,
+):
+
+    if not context.user_data.get(
+        "setlinks_mode"
+    ):
+        return False
+
+    if not is_admin(
+        update.effective_user.id
+    ):
+        return True
+
+    message = update.effective_message
+
+    text = (
+        message.text or ""
+    ).strip()
+
+    if not text:
+        return True
+
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    if len(lines) != 15:
+
+        await message.reply_text(
+            "❌ Exactly 15 lines വേണം.\n\n"
+            f"നിങ്ങൾ അയച്ചത്: {len(lines)}\n\n"
+            "15 names + 15 links അയക്കുക."
+        )
+
+        return True
+
+    all_buttons = []
+
+    for index, line in enumerate(
+        lines,
+        start=1,
+    ):
+
+        parts = [
+            x.strip()
+            for x in line.split("|")
+        ]
+
+        if len(parts) == 2:
+
+            button_text = parts[0]
+            button_url = parts[1]
+            button_style = "primary"
+
+        elif len(parts) == 3:
+
+            button_text = parts[0]
+            button_url = parts[1]
+            button_style = parts[2].lower()
+
+        else:
+
+            await message.reply_text(
+                "❌ Invalid line "
+                f"{index}.\n\n"
+                "Use:\n"
+                "Name | URL | Color"
+            )
+
+            return True
+
+        if not button_text:
+
+            await message.reply_text(
+                f"❌ Button name empty — Line {index}"
+            )
+
+            return True
+
+        if not valid_url(button_url):
+
+            await message.reply_text(
+                f"❌ Invalid URL — Line {index}\n\n"
+                f"{button_url}"
+            )
+
+            return True
+
+        if button_style not in (
+            "primary",
+            "success",
+            "danger",
+        ):
+
+            await message.reply_text(
+                f"❌ Invalid color — Line {index}\n\n"
+                "Use:\n"
+                "primary\n"
+                "success\n"
+                "danger"
+            )
+
+            return True
+
+        all_buttons.append(
+            {
+                "text": button_text[:64],
+                "url": button_url,
+                "style": button_style,
+            }
+        )
+
+    # --------------------------------------------------------
+    # SAVE 5 SETS
+    # --------------------------------------------------------
+
+    for set_index in range(5):
+
+        start = set_index * 3
+        end = start + 3
+
+        buttons = all_buttons[
+            start:end
+        ]
+
+        await save_promo_set(
+            set_index + 1,
+            buttons,
+        )
+
+    context.user_data.pop(
+        "setlinks_mode",
+        None,
+    )
+
+    await message.reply_text(
+        "✅ ALL 5 SETS SAVED!\n\n"
+
+        "📦 SET 1 → 3 buttons\n"
+        "📦 SET 2 → 3 buttons\n"
+        "📦 SET 3 → 3 buttons\n"
+        "📦 SET 4 → 3 buttons\n"
+        "📦 SET 5 → 3 buttons\n\n"
+
+        "🎯 Total:\n"
+        "15 Names\n"
+        "15 Links\n\n"
+
+        "🔄 Schedule ഇനി ഓരോ run-ലും "
+        "random rotation ഉപയോഗിക്കും.\n\n"
+
+        "👉 /sets"
+    )
+
+    return True
+
+
+# ============================================================
+# CLEAR SETS
+# ============================================================
+
+@admin_only
+async def clearsets_command(
+    update,
+    context,
+):
+
+    await sets_col.delete_many({})
+
+    # Reset schedule rotation
+    await schedules_col.update_many(
+        {},
+        {
+            "$set": {
+                "rotation_order": [1, 2, 3, 4, 5],
+                "rotation_pos": 0,
+                "updated_at": now(),
+            }
+        },
+    )
+
+    await update.effective_message.reply_text(
+        "🧹 ALL PROMOTION SETS CLEARED.\n\n"
+        "5 sets are now empty."
+    )
+
+
+# ============================================================
+# CREATE RANDOM ROTATION
+# ============================================================
+
+def create_rotation_order():
+
+    order = SET_NUMBERS.copy()
+
+    random.shuffle(order)
+
+    return order
+
+
+# ============================================================
+# GET NEXT SET NUMBER
+#
+# Every schedule has its own rotation.
+#
+# Example:
+# 4 → 1 → 5 → 2 → 3
+# Then new random cycle:
+# 2 → 5 → 1 → 3 → 4
+#
+# Same set will not repeat inside a cycle.
+# ============================================================
+
+def get_next_rotation(
+    doc
+):
+
+    order = doc.get(
+        "rotation_order"
+    )
+
+    pos = int(
+        doc.get(
+            "rotation_pos",
+            0,
+        )
+    )
+
+    if not order or len(order) != 5:
+
+        order = create_rotation_order()
+        pos = 0
+
+    if pos >= len(order):
+
+        order = create_rotation_order()
+        pos = 0
+
+    set_no = int(
+        order[pos]
+    )
+
+    next_pos = pos + 1
+
+    if next_pos >= len(order):
+
+        order = create_rotation_order()
+        next_pos = 0
+
+    return (
+        set_no,
+        order,
+        next_pos,
+    )
+
+
+# ============================================================
+# GET SET PAYLOAD
+# ============================================================
+
+async def get_set_payload(
+    set_no,
+    base_payload,
+):
+
+    row = await get_promo_set(
+        set_no
+    )
+
+    buttons = []
+
+    if row:
+
+        buttons = row.get(
+            "buttons",
+            []
+        )
+
+    payload = {
+        "photo_file_id": base_payload.get(
+            "photo_file_id"
+        ),
+        "text": base_payload.get(
+            "text"
+        ) or "",
+        "buttons": buttons[:3],
+    }
+
+    return payload
+
+
+# ============================================================
+# CAPTURE INTERVAL
 # ============================================================
 
 async def capture_interval(
@@ -1655,6 +2065,7 @@ async def capture_interval(
 
         await update.effective_message.reply_text(
             "❌ Invalid interval.\n\n"
+            "Choose:\n"
             "5m\n"
             "10m\n"
             "15m\n"
@@ -1664,29 +2075,66 @@ async def capture_interval(
 
         return
 
-    payload = build_payload(
+    # --------------------------------------------------------
+    # CHECK 5 SETS
+    # --------------------------------------------------------
+
+    configured = 0
+
+    for set_no in SET_NUMBERS:
+
+        row = await get_promo_set(
+            set_no
+        )
+
+        if row and len(
+            row.get("buttons", [])
+        ) == 3:
+
+            configured += 1
+
+    if configured < 5:
+
+        await update.effective_message.reply_text(
+            "❌ 5 Button Sets complete ചെയ്തിട്ടില്ല.\n\n"
+            f"Configured: {configured}/5\n\n"
+            "ആദ്യം:\n"
+            "/setlinks\n\n"
+            "15 names + 15 links അയക്കുക."
+        )
+
+        return
+
+    base_payload = build_payload(
         setup
     )
 
-    # --------------------------------------------------------
-    # Each schedule has its own random order.
-    # --------------------------------------------------------
-
-    sets = await get_promotion_sets()
-
-    set_order = list(range(5))
-
-    if len(sets) == 5:
-        random.shuffle(set_order)
+    first_order = create_rotation_order()
 
     doc = {
         "interval": INTERVALS[value],
         "interval_label": value,
-        "payload": payload,
+
+        # Content
+        "photo_file_id": base_payload.get(
+            "photo_file_id"
+        ),
+        "text": base_payload.get(
+            "text"
+        ) or "",
+
+        # Rotation
+        "rotation_order": first_order,
+        "rotation_pos": 0,
+
+        # Old compatibility
+        "payload": base_payload,
+
         "enabled": True,
+
+        # chat_id -> message_id
         "last_messages": {},
-        "set_order": set_order,
-        "set_position": 0,
+
         "created_at": now(),
         "updated_at": now(),
     }
@@ -1699,10 +2147,18 @@ async def capture_interval(
         result.inserted_id
     )
 
+    # --------------------------------------------------------
+    # FIRST SEND
+    # --------------------------------------------------------
+
     await run_schedule(
         schedule_id,
         context.application,
     )
+
+    # --------------------------------------------------------
+    # REPEATING JOB
+    # --------------------------------------------------------
 
     context.application.job_queue.run_repeating(
         scheduled_job,
@@ -1721,19 +2177,24 @@ async def capture_interval(
 
     await update.effective_message.reply_text(
         "✅ SCHEDULE CREATED\n\n"
+
         f"🆔 {schedule_id}\n"
         f"⏱ Every {value}\n\n"
-        "🎯 5 promotion sets enabled.\n"
-        "🔄 Sets will rotate automatically.\n"
-        "🎲 Random order is used.\n\n"
-        "🗑 Previous scheduled message "
-        "will be deleted before the next one.\n\n"
+
+        "🎨 5 Button Sets Active\n"
+        "📦 5 × 3 = 15 links\n\n"
+
+        "🔄 Random rotation enabled.\n"
+        "♻️ Same set will not repeat "
+        "until the current 5-set cycle ends.\n\n"
+
+        "🗑 Delete:\n"
         f"/delete_schedule {schedule_id}"
     )
 
 
 # ============================================================
-# DELETE MESSAGE
+# DELETE MESSAGE SAFE
 # ============================================================
 
 async def delete_message_safe(
@@ -1792,41 +2253,6 @@ async def delete_message_safe(
 
 
 # ============================================================
-# GET NEXT PROMOTION SET
-# ============================================================
-
-async def get_next_set(
-    schedule_doc,
-):
-
-    sets = await get_promotion_sets()
-
-    if len(sets) != 5:
-        return None
-
-    order = schedule_doc.get(
-        "set_order",
-        []
-    )
-
-    position = int(
-        schedule_doc.get(
-            "set_position",
-            0
-        )
-    )
-
-    if len(order) != 5:
-
-        order = list(range(5))
-        random.shuffle(order)
-
-    index = order[position % 5]
-
-    return sets[index]
-
-
-# ============================================================
 # RUN SCHEDULE
 # ============================================================
 
@@ -1843,6 +2269,11 @@ async def run_schedule(
 
     except Exception:
 
+        log.error(
+            "Invalid schedule ID: %s",
+            schedule_id,
+        )
+
         return
 
     doc = await schedules_col.find_one(
@@ -1855,6 +2286,57 @@ async def run_schedule(
     if not doc:
         return
 
+    # --------------------------------------------------------
+    # GET NEXT ROTATION SET
+    # --------------------------------------------------------
+
+    set_no, new_order, new_pos = (
+        get_next_rotation(doc)
+    )
+
+    # --------------------------------------------------------
+    # BASE PAYLOAD
+    # --------------------------------------------------------
+
+    base_payload = {
+        "photo_file_id": doc.get(
+            "photo_file_id"
+        ),
+        "text": doc.get(
+            "text"
+        ) or "",
+    }
+
+    # Old DB compatibility
+    if not base_payload["text"]:
+
+        old_payload = doc.get(
+            "payload",
+            {}
+        )
+
+        base_payload["text"] = (
+            old_payload.get("text")
+            or ""
+        )
+
+        if not base_payload["photo_file_id"]:
+
+            base_payload["photo_file_id"] = (
+                old_payload.get(
+                    "photo_file_id"
+                )
+            )
+
+    payload = await get_set_payload(
+        set_no,
+        base_payload,
+    )
+
+    # --------------------------------------------------------
+    # REGISTERED CHATS
+    # --------------------------------------------------------
+
     rows = await chats_col.find(
         {
             "enabled": True
@@ -1863,9 +2345,6 @@ async def run_schedule(
         length=5000
     )
 
-    if not rows:
-        return
-
     old_messages = doc.get(
         "last_messages",
         {}
@@ -1873,48 +2352,24 @@ async def run_schedule(
 
     new_messages = {}
 
-    # ========================================================
-    # PROMOTION SET MODE
-    # ========================================================
-
-    sets = await get_promotion_sets()
-
-    use_sets = len(sets) == 5
-
-    current_position = int(
-        doc.get(
-            "set_position",
-            0
-        )
+    log.info(
+        "SCHEDULE %s USING SET %s",
+        schedule_id,
+        set_no,
     )
 
-    order = doc.get(
-        "set_order",
-        []
-    )
-
-    if use_sets:
-
-        if len(order) != 5:
-
-            order = list(range(5))
-            random.shuffle(order)
-
-        current_set_index = order[
-            current_position % 5
-        ]
-
-    # ========================================================
-    # SEND TO EVERY CHAT
-    # ========================================================
+    # --------------------------------------------------------
+    # SEND TO ALL CHATS
+    # --------------------------------------------------------
 
     for row in rows:
 
         chat_id = row["chat_id"]
+
         key = str(chat_id)
 
         # ----------------------------------------------------
-        # DELETE OLD MESSAGE
+        # DELETE PREVIOUS MESSAGE
         # ----------------------------------------------------
 
         old_message_id = old_messages.get(
@@ -1930,45 +2385,7 @@ async def run_schedule(
             )
 
         # ----------------------------------------------------
-        # SELECT PROMOTION
-        # ----------------------------------------------------
-
-        if use_sets:
-
-            selected_set = sets[
-                current_set_index
-            ]
-
-            payload = {
-                "photo_file_id": doc.get(
-                    "payload",
-                    {}
-                ).get(
-                    "photo_file_id"
-                ),
-                "text": doc.get(
-                    "payload",
-                    {}
-                ).get(
-                    "text",
-                    ""
-                ),
-                "buttons": selected_set.get(
-                    "buttons",
-                    []
-                ),
-            }
-
-        else:
-
-            # Fallback to normal schedule
-            payload = doc.get(
-                "payload",
-                {}
-            )
-
-        # ----------------------------------------------------
-        # SEND
+        # SEND NEW MESSAGE
         # ----------------------------------------------------
 
         try:
@@ -1986,7 +2403,7 @@ async def run_schedule(
         except Exception as e:
 
             log.warning(
-                "Schedule failed chat=%s error=%s",
+                "Schedule failed %s: %s",
                 chat_id,
                 e,
             )
@@ -1995,69 +2412,23 @@ async def run_schedule(
             CHAT_SEND_DELAY
         )
 
-    # ========================================================
-    # NEXT SET
-    # ========================================================
-
-    update_data = {
-        "last_messages": new_messages,
-        "updated_at": now(),
-    }
-
-    if use_sets:
-
-        next_position = (
-            current_position + 1
-        )
-
-        # ----------------------------------------------------
-        # After all 5 sets:
-        # create a new random order.
-        # ----------------------------------------------------
-
-        if next_position >= 5:
-
-            new_order = list(
-                range(5)
-            )
-
-            random.shuffle(
-                new_order
-            )
-
-            # Never start next cycle with
-            # the same set that ended previous cycle.
-            if (
-                new_order[0]
-                == order[4]
-                and len(new_order) > 1
-            ):
-
-                new_order[0], new_order[1] = (
-                    new_order[1],
-                    new_order[0],
-                )
-
-            update_data[
-                "set_order"
-            ] = new_order
-
-            update_data[
-                "set_position"
-            ] = 0
-
-        else:
-
-            update_data[
-                "set_position"
-            ] = next_position
+    # --------------------------------------------------------
+    # SAVE ROTATION + MESSAGE IDS
+    # --------------------------------------------------------
 
     await schedules_col.update_one(
         {
             "_id": object_id
         },
         {
-            "$set": update_data
+            "$set": {
+                "last_messages": new_messages,
+                "rotation_order": new_order,
+                "rotation_pos": new_pos,
+                "last_set": set_no,
+                "last_run_at": now(),
+                "updated_at": now(),
+            }
         },
     )
 
@@ -2115,6 +2486,29 @@ async def restore_schedules(
         schedule_id = str(
             row["_id"]
         )
+
+        # ----------------------------------------------------
+        # FIX OLD / INVALID ROTATION DATA
+        # ----------------------------------------------------
+
+        order = row.get(
+            "rotation_order"
+        )
+
+        if not order or len(order) != 5:
+
+            await schedules_col.update_one(
+                {
+                    "_id": row["_id"]
+                },
+                {
+                    "$set": {
+                        "rotation_order": create_rotation_order(),
+                        "rotation_pos": 0,
+                        "updated_at": now(),
+                    }
+                },
+            )
 
         for job in (
             application
@@ -2189,18 +2583,16 @@ async def schedules(
             else "⏸ OFF"
         )
 
-        position = int(
-            row.get(
-                "set_position",
-                0
-            )
+        last_set = row.get(
+            "last_set",
+            "-"
         )
 
         lines.append(
             f"{status}\n"
             f"🆔 {sid}\n"
             f"⏱ Every {row.get('interval_label', '-')}\n"
-            f"🎯 Next Set: {(position % 5) + 1}\n"
+            f"🎨 Last Set: {last_set}\n"
         )
 
     await update.effective_message.reply_text(
@@ -2230,7 +2622,9 @@ async def pause(
 
     try:
 
-        object_id = ObjectId(sid)
+        object_id = ObjectId(
+            sid
+        )
 
     except Exception:
 
@@ -2297,7 +2691,9 @@ async def resume(
 
     try:
 
-        object_id = ObjectId(sid)
+        object_id = ObjectId(
+            sid
+        )
 
     except Exception:
 
@@ -2401,11 +2797,24 @@ async def stop_all_schedules(
 
             removed_jobs += 1
 
+    if (
+        result.modified_count == 0
+        and removed_jobs == 0
+    ):
+
+        await update.effective_message.reply_text(
+            "ℹ️ NO ACTIVE SCHEDULES\n\n"
+            "There are no running schedules."
+        )
+
+        return
+
     await update.effective_message.reply_text(
         "🛑 ALL SCHEDULES STOPPED\n\n"
         f"🔴 Stopped: {result.modified_count}\n"
-        f"⏹ Jobs removed: {removed_jobs}\n\n"
-        "💾 Schedules are still saved."
+        f"⏹️ Jobs removed: {removed_jobs}\n\n"
+        "💾 Schedules are still saved.\n"
+        "▶️ Use /resume ID to start one again."
     )
 
 
@@ -2431,7 +2840,9 @@ async def delete_schedule(
 
     try:
 
-        object_id = ObjectId(sid)
+        object_id = ObjectId(
+            sid
+        )
 
     except Exception:
 
@@ -2494,12 +2905,13 @@ async def delete_schedule(
         "🗑 SCHEDULE DELETED\n\n"
         f"🆔 {sid}\n"
         f"✅ Messages deleted: {deleted}\n"
-        f"❌ Failed: {failed}"
+        f"❌ Failed: {failed}\n\n"
+        "💾 Schedule record removed."
     )
 
 
 # ============================================================
-# DELETE ALL SCHEDULE MESSAGES
+# DELETE ALL CURRENT SCHEDULE MESSAGES
 # ============================================================
 
 @admin_only
@@ -2566,11 +2978,12 @@ async def delete_all_schedule_messages(
 
     await update.effective_message.reply_text(
         "🧹 ALL SCHEDULE MESSAGES PROCESSED\n\n"
-        f"📦 Tracked: {total_messages}\n"
+        f"📦 Tracked messages: {total_messages}\n"
         f"✅ Deleted: {deleted}\n"
         f"❌ Failed: {failed}\n\n"
-        "⚠️ Active schedules will send again "
-        "at the next interval."
+        "💾 Schedule settings are still saved.\n\n"
+        "⚠️ Active schedules will send a new "
+        "message again at their next interval."
     )
 
 
@@ -2590,7 +3003,7 @@ async def cancel(
     )
 
     context.user_data.pop(
-        "set_setup",
+        "setlinks_mode",
         None,
     )
 
@@ -2609,23 +3022,19 @@ async def setup_router(
 ):
 
     # --------------------------------------------------------
-    # PROMOTION SETUP HAS PRIORITY
+    # SET LINKS HAS PRIORITY
     # --------------------------------------------------------
 
     if context.user_data.get(
-        "set_setup"
+        "setlinks_mode"
     ):
 
-        await capture_promotion_sets(
+        await capture_setlinks(
             update,
             context,
         )
 
         return
-
-    # --------------------------------------------------------
-    # NORMAL SETUP
-    # --------------------------------------------------------
 
     setup = context.user_data.get(
         "setup"
@@ -2661,7 +3070,7 @@ async def setup_router(
 
 
 # ============================================================
-# ERROR
+# ERROR HANDLER
 # ============================================================
 
 async def error_handler(
@@ -2669,9 +3078,11 @@ async def error_handler(
     context,
 ):
 
+    error = context.error
+
     log.error(
         "Unhandled error: %s",
-        context.error,
+        error,
         exc_info=True,
     )
 
@@ -2706,7 +3117,17 @@ async def post_init(
     users_col = db["users"]
     chats_col = db["chats"]
     schedules_col = db["schedules"]
-    sets_col = db["promotion_sets"]
+    sets_col = db["promo_sets"]
+
+    # ========================================================
+    # INDEXES
+    #
+    # IMPORTANT:
+    # NEVER CREATE UNIQUE INDEX ON _id
+    #
+    # MongoDB ALREADY HAS:
+    # _id_ unique index
+    # ========================================================
 
     await users_col.create_index(
         "user_id",
@@ -2722,10 +3143,18 @@ async def post_init(
         "enabled"
     )
 
+    # --------------------------------------------------------
+    # CORRECT SET INDEX
+    # --------------------------------------------------------
+
     await sets_col.create_index(
-        "_id",
+        "set_no",
         unique=True,
     )
+
+    # --------------------------------------------------------
+    # RESTORE SCHEDULES
+    # --------------------------------------------------------
 
     await restore_schedules(
         application
@@ -2878,29 +3307,44 @@ def main():
 
     application.add_handler(
         CommandHandler(
+            "cancel",
+            cancel,
+        )
+    )
+
+    # ========================================================
+    # PROMOTION SET COMMANDS
+    # ========================================================
+
+    application.add_handler(
+        CommandHandler(
             "sets",
-            promotion_sets,
+            sets_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
-            "setstatus",
-            set_status,
+            "setlinks",
+            setlinks_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "clearsets",
-            clear_sets,
+            clearsets_command,
         )
     )
 
+    # ========================================================
+    # ADMIN CALLBACK BUTTONS
+    # ========================================================
+
     application.add_handler(
-        CommandHandler(
-            "cancel",
-            cancel,
+        CallbackQueryHandler(
+            admin_callback,
+            pattern=r"^admin_",
         )
     )
 
@@ -2938,7 +3382,7 @@ def main():
     )
 
     # ========================================================
-    # ERROR
+    # ERROR HANDLER
     # ========================================================
 
     application.add_error_handler(
@@ -2948,6 +3392,10 @@ def main():
     log.info(
         "Starting promotion bot..."
     )
+
+    # ========================================================
+    # ONE POLLING INSTANCE
+    # ========================================================
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
