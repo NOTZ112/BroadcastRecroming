@@ -2,8 +2,9 @@ import os
 import asyncio
 import logging
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import wraps
+from zoneinfo import ZoneInfo
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
@@ -58,16 +59,30 @@ INTERVALS = {
 }
 SET_NUMBERS = [1, 2, 3, 4, 5]
 
+# ============================================================
+# NEW AUTPOST SETTINGS
+# ============================================================
+
+IST = ZoneInfo("Asia/Kolkata")
+
+AUTPOST_CHECK_INTERVAL = 5
+AUTOPOST_MAX_INTERVAL = 1440
+
 mongo = None
 db = None
 users_col = None
 chats_col = None
 schedules_col = None
 sets_col = None
+autoposts_col = None
 
 
 def now():
     return datetime.now(timezone.utc)
+
+
+def ist_now():
+    return datetime.now(IST)
 
 
 def is_admin(user_id: int) -> bool:
@@ -333,6 +348,9 @@ async def help_command(update, context):
         "🔄 SCHEDULE\n/schedule\n/schedules\n"
         "/pause ID\n/resume ID\n/stopall\n"
         "/delete_schedule ID\n/deleteall\n\n"
+        "🚀 AUTOPOST\n/autopost\n/autoposts\n"
+        "/pause_autopost ID\n/resume_autopost ID\n"
+        "/delete_autopost ID\n/deleteall_autopost\n\n"
         "🎨 PROMOTION SETS\n/sets\n/setlinks\n/clearsets\n\n"
         "📊 CHATS\n/chats\n\n"
         "❌ /cancel\n\n"
@@ -342,7 +360,11 @@ async def help_command(update, context):
         "📌 Total = 15 names + 15 links\n\n"
         "🔄 SCHEDULE\n"
         "ഓരോ group/channel-ലും വേറെ വേറെ set പോകും.\n"
-        "ഓരോ run-ലും set assignment shuffle ചെയ്യും.",
+        "ഓരോ run-ലും set assignment shuffle ചെയ്യും.\n\n"
+        "🚀 AUTOPOST\n"
+        "ഒരു message എല്ലാ groups/channels-ലേക്കും same ആയി പോകും.\n"
+        "Date + Start + End + Interval set ചെയ്യാം."
+        ,
         reply_markup=admin_panel_keyboard(),
     )
 
@@ -453,6 +475,15 @@ async def schedule(update, context):
     await begin_setup(update, context, "schedule")
 
 
+# ============================================================
+# NEW: AUTOPOST COMMAND
+# ============================================================
+
+@admin_only
+async def autopost(update, context):
+    await begin_setup(update, context, "autopost")
+
+
 async def capture_content(update, context):
     setup = context.user_data.get("setup")
     if not setup or setup.get("step") != "content":
@@ -468,6 +499,33 @@ async def capture_content(update, context):
         setup["text"] = message.text
     else:
         return
+
+    # ========================================================
+    # NEW AUTOPOST FLOW
+    # ========================================================
+
+    if setup["mode"] == "autopost":
+        setup["step"] = "button"
+
+        await message.reply_text(
+            "🎨 AUTOPOST BUTTON SETUP\n\n"
+            "Maximum 3 buttons.\n\n"
+            "Format:\n"
+            "Button Text | URL | Color\n\n"
+            "Example:\n"
+            "🎬 Watch | https://example.com | primary\n"
+            "👥 Group | https://t.me/group | success\n"
+            "📢 Channel | https://t.me/channel | danger\n\n"
+            "🔵 primary\n"
+            "🟢 success\n"
+            "🔴 danger\n\n"
+            "Or send: skip"
+        )
+        return
+
+    # ========================================================
+    # OLD SCHEDULE FLOW — UNCHANGED
+    # ========================================================
 
     if setup["mode"] == "schedule":
         setup["step"] = "interval"
@@ -551,6 +609,22 @@ async def capture_button(update, context):
             })
 
         setup["buttons"] = buttons
+
+    # ========================================================
+    # NEW AUTOPOST FLOW
+    # ========================================================
+
+    if setup["mode"] == "autopost":
+        setup["step"] = "date"
+
+        await update.effective_message.reply_text(
+            "📅 AUTOPOST DATE\n\n"
+            "Date അയക്കുക:\n\n"
+            "DD/MM/YYYY\n\n"
+            "Example:\n"
+            "18/09/2026"
+        )
+        return
 
     if setup["mode"] == "broadcast":
         await execute_chat_broadcast(update, context)
@@ -871,7 +945,7 @@ async def clearsets_command(update, context):
 
 
 # ============================================================
-# SCHEDULE
+# OLD SCHEDULE — UNCHANGED
 # ============================================================
 
 async def get_set_payload(set_no, base_payload):
@@ -935,7 +1009,6 @@ async def capture_interval(update, context):
     result = await schedules_col.insert_one(doc)
     schedule_id = str(result.inserted_id)
 
-    # First run immediately sends DIFFERENT sets to different chats.
     await run_schedule(schedule_id, context.application)
 
     context.application.job_queue.run_repeating(
@@ -983,23 +1056,6 @@ async def delete_message_safe(bot, chat_id, message_id):
     return False
 
 
-# ============================================================
-# IMPORTANT NEW LOGIC
-#
-# ഓരോ run-ലും:
-# 1. Active chats എടുത്ത് shuffle ചെയ്യും.
-# 2. 5 sets shuffle ചെയ്യും.
-# 3. Chat index അനുസരിച്ച് different set നൽകും.
-# 4. 5 chats കഴിഞ്ഞാൽ set cycle വീണ്ടും തുടങ്ങും.
-#
-# ഉദാഹരണം:
-# Chats: A B C D E F G
-# Sets : 4 1 5 2 3 4 1
-#
-# അതായത് ഒരേ set എല്ലാ chats-ലേക്കും പോകില്ല.
-# /setlinks-ൽ save ചെയ്ത പേരുകളും links-ഉം മാറ്റില്ല.
-# ============================================================
-
 async def run_schedule(schedule_id, application):
     try:
         object_id = ObjectId(schedule_id)
@@ -1023,14 +1079,8 @@ async def run_schedule(schedule_id, application):
         log.info("SCHEDULE %s: No active chats.", schedule_id)
         return
 
-    # --------------------------------------------------------
-    # NEW: SHUFFLE CHAT ORDER
-    # --------------------------------------------------------
     random.shuffle(rows)
 
-    # --------------------------------------------------------
-    # NEW: SHUFFLE ALL 5 SETS FOR THIS RUN
-    # --------------------------------------------------------
     set_order = SET_NUMBERS.copy()
     random.shuffle(set_order)
 
@@ -1046,7 +1096,6 @@ async def run_schedule(schedule_id, application):
         "text": doc.get("text") or "",
     }
 
-    # Old DB compatibility
     old_payload = doc.get("payload", {})
     if not base_payload["text"]:
         base_payload["text"] = old_payload.get("text") or ""
@@ -1061,15 +1110,6 @@ async def run_schedule(schedule_id, application):
         chat_id = row["chat_id"]
         key = str(chat_id)
 
-        # ----------------------------------------------------
-        # NEW: DIFFERENT SET PER CHAT
-        #
-        # 0 -> set_order[0]
-        # 1 -> set_order[1]
-        # ...
-        # 4 -> set_order[4]
-        # 5 -> set_order[0] again
-        # ----------------------------------------------------
         set_no = set_order[index % 5]
 
         payload = await get_set_payload(
@@ -1077,9 +1117,6 @@ async def run_schedule(schedule_id, application):
             base_payload,
         )
 
-        # ----------------------------------------------------
-        # DELETE PREVIOUS MESSAGE FOR THIS CHAT
-        # ----------------------------------------------------
         old_message_id = old_messages.get(key)
 
         if old_message_id:
@@ -1089,9 +1126,6 @@ async def run_schedule(schedule_id, application):
                 old_message_id,
             )
 
-        # ----------------------------------------------------
-        # SEND THIS CHAT'S OWN SET
-        # ----------------------------------------------------
         try:
             message = await safe_chat_send(
                 application.bot,
@@ -1118,13 +1152,6 @@ async def run_schedule(schedule_id, application):
 
         await asyncio.sleep(CHAT_SEND_DELAY)
 
-    # --------------------------------------------------------
-    # SAVE ONLY MESSAGE TRACKING.
-    #
-    # IMPORTANT:
-    # promo_sets collection is NOT modified here.
-    # Your 15 names + 15 links remain unchanged.
-    # --------------------------------------------------------
     await schedules_col.update_one(
         {"_id": object_id},
         {
@@ -1389,6 +1416,893 @@ async def delete_all_schedule_messages(update, context):
     )
 
 
+# ============================================================
+# NEW AUTOPOST
+# ============================================================
+
+def parse_autopost_date(value):
+    try:
+        return datetime.strptime(value.strip(), "%d/%m/%Y").date()
+    except ValueError:
+        return None
+
+
+def parse_autopost_time(value):
+    value = value.strip()
+
+    for fmt in ("%H:%M", "%I:%M %p", "%I:%M%p"):
+        try:
+            return datetime.strptime(value.upper(), fmt).time()
+        except ValueError:
+            pass
+
+    return None
+
+
+def make_autopost_window(run_date, start_time, end_time):
+    start_dt = datetime.combine(
+        run_date,
+        start_time,
+        tzinfo=IST,
+    )
+
+    end_dt = datetime.combine(
+        run_date,
+        end_time,
+        tzinfo=IST,
+    )
+
+    # Example:
+    # 22:30 -> 00:00
+    # End is treated as next day.
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
+
+    return start_dt, end_dt
+
+
+def calculate_first_autopost_run(start_dt, end_dt, interval_seconds):
+    current = ist_now()
+
+    if current < start_dt:
+        return start_dt
+
+    if current > end_dt:
+        return None
+
+    elapsed = (current - start_dt).total_seconds()
+
+    if elapsed <= 0:
+        return start_dt
+
+    steps = int(elapsed // interval_seconds)
+
+    candidate = start_dt + timedelta(
+        seconds=steps * interval_seconds
+    )
+
+    if candidate < current:
+        candidate += timedelta(seconds=interval_seconds)
+
+    if candidate > end_dt:
+        return None
+
+    return candidate
+
+
+async def capture_autopost_date(update, context):
+    setup = context.user_data.get("setup")
+    if not setup or setup.get("mode") != "autopost":
+        return
+
+    value = (update.effective_message.text or "").strip()
+    run_date = parse_autopost_date(value)
+
+    if not run_date:
+        await update.effective_message.reply_text(
+            "❌ Invalid date.\n\n"
+            "Use:\n"
+            "DD/MM/YYYY\n\n"
+            "Example:\n"
+            "18/09/2026"
+        )
+        return
+
+    today = ist_now().date()
+
+    if run_date < today:
+        await update.effective_message.reply_text(
+            "❌ Past date അനുവദിക്കില്ല.\n\n"
+            "Future date നൽകുക."
+        )
+        return
+
+    setup["run_date"] = run_date.isoformat()
+    setup["step"] = "start_time"
+
+    await update.effective_message.reply_text(
+        "🕙 START TIME\n\n"
+        "Time അയക്കുക:\n\n"
+        "24-hour format:\n"
+        "HH:MM\n\n"
+        "Example:\n"
+        "22:30\n\n"
+        "🌙 Night example: 10:30 PM = 22:30"
+    )
+
+
+async def capture_autopost_start_time(update, context):
+    setup = context.user_data.get("setup")
+    if not setup or setup.get("mode") != "autopost":
+        return
+
+    value = (update.effective_message.text or "").strip()
+    start_time = parse_autopost_time(value)
+
+    if not start_time:
+        await update.effective_message.reply_text(
+            "❌ Invalid time.\n\n"
+            "Use HH:MM\n"
+            "Example: 22:30"
+        )
+        return
+
+    setup["start_time"] = start_time.strftime("%H:%M")
+    setup["step"] = "end_time"
+
+    await update.effective_message.reply_text(
+        "🕛 END TIME\n\n"
+        "Time അയക്കുക:\n\n"
+        "HH:MM\n\n"
+        "Example:\n"
+        "00:00\n\n"
+        "22:30 → 00:00 കൊടുത്താൽ\n"
+        "അത് അടുത്ത ദിവസത്തെ 00:00 ആയി കണക്കാക്കും."
+    )
+
+
+async def capture_autopost_end_time(update, context):
+    setup = context.user_data.get("setup")
+    if not setup or setup.get("mode") != "autopost":
+        return
+
+    value = (update.effective_message.text or "").strip()
+    end_time = parse_autopost_time(value)
+
+    if not end_time:
+        await update.effective_message.reply_text(
+            "❌ Invalid time.\n\n"
+            "Use HH:MM\n"
+            "Example: 00:00"
+        )
+        return
+
+    start_time = datetime.strptime(
+        setup["start_time"],
+        "%H:%M",
+    ).time()
+
+    run_date = datetime.strptime(
+        setup["run_date"],
+        "%Y-%m-%d",
+    ).date()
+
+    start_dt, end_dt = make_autopost_window(
+        run_date,
+        start_time,
+        end_time,
+    )
+
+    if end_dt <= start_dt:
+        await update.effective_message.reply_text(
+            "❌ Invalid time range."
+        )
+        return
+
+    if end_dt <= ist_now():
+        await update.effective_message.reply_text(
+            "❌ ഈ schedule സമയം കഴിഞ്ഞതാണ്.\n\n"
+            "Future time നൽകുക."
+        )
+        return
+
+    setup["end_time"] = end_time.strftime("%H:%M")
+    setup["step"] = "autopost_interval"
+
+    await update.effective_message.reply_text(
+        "⏱️ INTERVAL\n\n"
+        "എത്ര minutes ഇടവിട്ട് message അയക്കണം?\n\n"
+        "Number മാത്രം അയക്കുക.\n\n"
+        "Example:\n"
+        "2\n\n"
+        "അതായത് ഓരോ 2 minutes-ലും.\n\n"
+        "Minimum: 1 minute"
+    )
+
+
+async def capture_autopost_interval(update, context):
+    setup = context.user_data.get("setup")
+    if not setup or setup.get("mode") != "autopost":
+        return
+
+    value = (update.effective_message.text or "").strip()
+
+    try:
+        minutes = int(value)
+    except ValueError:
+        await update.effective_message.reply_text(
+            "❌ Number മാത്രം നൽകുക.\n\n"
+            "Example: 2"
+        )
+        return
+
+    if minutes < 1 or minutes > AUTOPOST_MAX_INTERVAL:
+        await update.effective_message.reply_text(
+            f"❌ Interval 1 മുതൽ {AUTOPOST_MAX_INTERVAL} minutes വരെ മാത്രം."
+        )
+        return
+
+    run_date = datetime.strptime(
+        setup["run_date"],
+        "%Y-%m-%d",
+    ).date()
+
+    start_time = datetime.strptime(
+        setup["start_time"],
+        "%H:%M",
+    ).time()
+
+    end_time = datetime.strptime(
+        setup["end_time"],
+        "%H:%M",
+    ).time()
+
+    start_dt, end_dt = make_autopost_window(
+        run_date,
+        start_time,
+        end_time,
+    )
+
+    interval_seconds = minutes * 60
+
+    first_run = calculate_first_autopost_run(
+        start_dt,
+        end_dt,
+        interval_seconds,
+    )
+
+    if not first_run:
+        await update.effective_message.reply_text(
+            "❌ ഈ schedule-ന്റെ സമയം കഴിഞ്ഞു."
+        )
+        context.user_data.pop("setup", None)
+        return
+
+    payload = build_payload(setup)
+
+    doc = {
+        "photo_file_id": payload.get("photo_file_id"),
+        "text": payload.get("text") or "",
+        "payload": payload,
+        "buttons": payload.get("buttons", []),
+
+        "run_date": setup["run_date"],
+        "start_time": setup["start_time"],
+        "end_time": setup["end_time"],
+
+        "interval_minutes": minutes,
+        "interval_seconds": interval_seconds,
+        "interval_label": f"{minutes}m",
+
+        "start_at": start_dt.astimezone(timezone.utc),
+        "end_at": end_dt.astimezone(timezone.utc),
+        "next_run_at": first_run.astimezone(timezone.utc),
+
+        "enabled": True,
+        "status": "scheduled",
+
+        "last_messages": {},
+        "last_run_at": None,
+
+        "created_at": now(),
+        "updated_at": now(),
+    }
+
+    result = await autoposts_col.insert_one(doc)
+    autopost_id = str(result.inserted_id)
+
+    context.user_data.pop("setup", None)
+
+    await update.effective_message.reply_text(
+        "✅ AUTOPOST CREATED\n\n"
+        f"🆔 {autopost_id}\n"
+        f"📅 Date: {run_date.strftime('%d/%m/%Y')}\n"
+        f"🕙 Start: {setup['start_time']}\n"
+        f"🕛 End: {setup['end_time']}\n"
+        f"⏱ Interval: {minutes} minute(s)\n\n"
+        "📢 എല്ലാ registered groups/channels-ലും\n"
+        "SAME message ആയിരിക്കും പോകുക.\n\n"
+        "🗑️ പുതിയ message അയക്കുന്നതിന് മുമ്പ്\n"
+        "ആ chat-ലെ previous autopost message delete ചെയ്യും.\n\n"
+        "💾 MongoDB-യിൽ saved.\n"
+        "🔄 Bot restart ചെയ്താലും തുടരും.\n\n"
+        f"🆔 ID: {autopost_id}"
+    )
+
+
+async def run_autopost(autopost_id, application):
+    try:
+        object_id = ObjectId(autopost_id)
+    except Exception:
+        log.error("Invalid autopost ID: %s", autopost_id)
+        return
+
+    doc = await autoposts_col.find_one({
+        "_id": object_id,
+        "enabled": True,
+    })
+
+    if not doc:
+        return
+
+    payload = doc.get("payload") or {
+        "photo_file_id": doc.get("photo_file_id"),
+        "text": doc.get("text") or "",
+        "buttons": doc.get("buttons") or [],
+    }
+
+    rows = await chats_col.find({
+        "enabled": True,
+        "type": {"$in": ["group", "supergroup", "channel"]},
+    }).to_list(length=5000)
+
+    if not rows:
+        log.info(
+            "AUTOPOST %s: No active groups/channels.",
+            autopost_id,
+        )
+        return
+
+    old_messages = doc.get("last_messages", {})
+    new_messages = {}
+
+    sent = 0
+    failed = 0
+
+    log.info(
+        "AUTOPOST %s | Sending SAME message to %d chats",
+        autopost_id,
+        len(rows),
+    )
+
+    for row in rows:
+        chat_id = row["chat_id"]
+        key = str(chat_id)
+
+        # ----------------------------------------------------
+        # DELETE PREVIOUS AUTOPOST MESSAGE
+        # ----------------------------------------------------
+
+        old_message_id = old_messages.get(key)
+
+        if old_message_id:
+            await delete_message_safe(
+                application.bot,
+                chat_id,
+                old_message_id,
+            )
+
+        # ----------------------------------------------------
+        # SEND SAME MESSAGE
+        # ----------------------------------------------------
+
+        try:
+            message = await safe_chat_send(
+                application.bot,
+                chat_id,
+                payload,
+            )
+
+            new_messages[key] = message.message_id
+            sent += 1
+
+            log.info(
+                "AUTOPOST %s | chat=%s | SENT",
+                autopost_id,
+                chat_id,
+            )
+
+        except Exception as e:
+            failed += 1
+
+            log.warning(
+                "AUTOPOST failed | id=%s | chat=%s | error=%s",
+                autopost_id,
+                chat_id,
+                e,
+            )
+
+        await asyncio.sleep(CHAT_SEND_DELAY)
+
+    await autoposts_col.update_one(
+        {"_id": object_id},
+        {
+            "$set": {
+                "last_messages": new_messages,
+                "last_run_at": now(),
+                "updated_at": now(),
+            }
+        },
+    )
+
+    log.info(
+        "AUTOPOST %s completed | sent=%d | failed=%d",
+        autopost_id,
+        sent,
+        failed,
+    )
+
+
+async def autopost_scheduler_job(context):
+    current = now()
+
+    rows = await autoposts_col.find({
+        "enabled": True,
+        "status": {"$in": ["scheduled", "running"]},
+        "next_run_at": {"$lte": current},
+    }).to_list(length=100)
+
+    for row in rows:
+        autopost_id = str(row["_id"])
+
+        # ----------------------------------------------------
+        # Atomic claim.
+        #
+        # Prevents the same schedule from being picked twice
+        # at the same moment.
+        # ----------------------------------------------------
+
+        claim_until = current + timedelta(minutes=10)
+
+        claimed = await autoposts_col.find_one_and_update(
+            {
+                "_id": row["_id"],
+                "enabled": True,
+                "status": {"$in": ["scheduled", "running"]},
+                "next_run_at": {"$lte": current},
+                "$or": [
+                    {"lease_until": {"$exists": False}},
+                    {"lease_until": {"$lte": current}},
+                ],
+            },
+            {
+                "$set": {
+                    "status": "running",
+                    "lease_until": claim_until,
+                    "updated_at": now(),
+                }
+            },
+        )
+
+        if not claimed:
+            continue
+
+        try:
+            await run_autopost(
+                autopost_id,
+                context.application,
+            )
+
+            fresh = await autoposts_col.find_one({
+                "_id": row["_id"],
+            })
+
+            if not fresh:
+                continue
+
+            old_next = fresh.get("next_run_at")
+            end_at = fresh.get("end_at")
+
+            if not old_next or not end_at:
+                await autoposts_col.update_one(
+                    {"_id": row["_id"]},
+                    {
+                        "$set": {
+                            "enabled": False,
+                            "status": "completed",
+                            "completed_at": now(),
+                            "updated_at": now(),
+                        },
+                        "$unset": {
+                            "lease_until": "",
+                        },
+                    },
+                )
+                continue
+
+            next_run = old_next + timedelta(
+                seconds=int(
+                    fresh.get(
+                        "interval_seconds",
+                        int(fresh.get("interval_minutes", 1)) * 60,
+                    )
+                )
+            )
+
+            # ------------------------------------------------
+            # END TIME INCLUDED
+            #
+            # Example:
+            # 22:30 to 00:00 every 2 min
+            #
+            # 22:30
+            # 22:32
+            # ...
+            # 23:58
+            # 00:00
+            # ------------------------------------------------
+
+            if next_run <= end_at:
+                await autoposts_col.update_one(
+                    {"_id": row["_id"]},
+                    {
+                        "$set": {
+                            "next_run_at": next_run,
+                            "status": "scheduled",
+                            "updated_at": now(),
+                        },
+                        "$unset": {
+                            "lease_until": "",
+                        },
+                    },
+                )
+            else:
+                await autoposts_col.update_one(
+                    {"_id": row["_id"]},
+                    {
+                        "$set": {
+                            "enabled": False,
+                            "status": "completed",
+                            "completed_at": now(),
+                            "updated_at": now(),
+                        },
+                        "$unset": {
+                            "lease_until": "",
+                        },
+                    },
+                )
+
+        except Exception as e:
+            log.error(
+                "AUTOPOST scheduler error id=%s error=%s",
+                autopost_id,
+                e,
+                exc_info=True,
+            )
+
+            await autoposts_col.update_one(
+                {"_id": row["_id"]},
+                {
+                    "$set": {
+                        "status": "scheduled",
+                        "lease_until": now(),
+                        "updated_at": now(),
+                    }
+                },
+            )
+
+
+async def restore_autopost_scheduler(application):
+    # One persistent polling job handles all future autoposts.
+    for job in application.job_queue.get_jobs_by_name(
+        "autopost:master"
+    ):
+        job.schedule_removal()
+
+    application.job_queue.run_repeating(
+        autopost_scheduler_job,
+        interval=AUTPOST_CHECK_INTERVAL,
+        first=5,
+        name="autopost:master",
+    )
+
+    count = await autoposts_col.count_documents({
+        "enabled": True,
+    })
+
+    log.info(
+        "Autopost scheduler restored | active=%d",
+        count,
+    )
+
+
+@admin_only
+async def autoposts(update, context):
+    rows = await autoposts_col.find().sort(
+        "created_at",
+        -1,
+    ).to_list(length=100)
+
+    if not rows:
+        await update.effective_message.reply_text(
+            "❌ No autoposts."
+        )
+        return
+
+    lines = ["🚀 AUTOPOSTS\n"]
+
+    for row in rows:
+        enabled = row.get("enabled", False)
+        status = row.get("status", "-")
+
+        if enabled:
+            status_text = "🟢 ON"
+        elif status == "completed":
+            status_text = "✅ COMPLETED"
+        else:
+            status_text = "⏸ OFF"
+
+        lines.append(
+            f"{status_text}\n"
+            f"🆔 {row['_id']}\n"
+            f"📅 {row.get('run_date', '-')}\n"
+            f"🕙 {row.get('start_time', '-')}"
+            f" → {row.get('end_time', '-')}\n"
+            f"⏱ Every {row.get('interval_label', '-')}\n"
+            f"📌 Status: {status}\n"
+        )
+
+    await update.effective_message.reply_text(
+        "\n".join(lines)
+    )
+
+
+@admin_only
+async def pause_autopost(update, context):
+    if not context.args:
+        await update.effective_message.reply_text(
+            "/pause_autopost <autopost_id>"
+        )
+        return
+
+    sid = context.args[0]
+
+    try:
+        object_id = ObjectId(sid)
+    except Exception:
+        await update.effective_message.reply_text(
+            "❌ Invalid ID."
+        )
+        return
+
+    result = await autoposts_col.update_one(
+        {"_id": object_id},
+        {
+            "$set": {
+                "enabled": False,
+                "status": "paused",
+                "updated_at": now(),
+            },
+            "$unset": {
+                "lease_until": "",
+            },
+        },
+    )
+
+    await update.effective_message.reply_text(
+        "⏸️ Autopost paused."
+        if result.matched_count
+        else "❌ Autopost not found."
+    )
+
+
+@admin_only
+async def resume_autopost(update, context):
+    if not context.args:
+        await update.effective_message.reply_text(
+            "/resume_autopost <autopost_id>"
+        )
+        return
+
+    sid = context.args[0]
+
+    try:
+        object_id = ObjectId(sid)
+    except Exception:
+        await update.effective_message.reply_text(
+            "❌ Invalid ID."
+        )
+        return
+
+    row = await autoposts_col.find_one({
+        "_id": object_id,
+    })
+
+    if not row:
+        await update.effective_message.reply_text(
+            "❌ Autopost not found."
+        )
+        return
+
+    if row.get("status") == "completed":
+        await update.effective_message.reply_text(
+            "❌ This autopost is already completed.\n\n"
+            "Create a new /autopost for another date."
+        )
+        return
+
+    current = now()
+    next_run = row.get("next_run_at")
+    end_at = row.get("end_at")
+
+    if not next_run or not end_at:
+        await update.effective_message.reply_text(
+            "❌ Schedule timing information missing."
+        )
+        return
+
+    if next_run < current:
+        interval_seconds = int(
+            row.get(
+                "interval_seconds",
+                int(row.get("interval_minutes", 1)) * 60,
+            )
+        )
+
+        while next_run < current:
+            next_run += timedelta(
+                seconds=interval_seconds
+            )
+
+        if next_run > end_at:
+            await autoposts_col.update_one(
+                {"_id": object_id},
+                {
+                    "$set": {
+                        "enabled": False,
+                        "status": "completed",
+                        "completed_at": now(),
+                        "updated_at": now(),
+                    }
+                },
+            )
+
+            await update.effective_message.reply_text(
+                "❌ Autopost time window is already over."
+            )
+            return
+
+    await autoposts_col.update_one(
+        {"_id": object_id},
+        {
+            "$set": {
+                "enabled": True,
+                "status": "scheduled",
+                "next_run_at": next_run,
+                "updated_at": now(),
+            },
+            "$unset": {
+                "lease_until": "",
+            },
+        },
+    )
+
+    await update.effective_message.reply_text(
+        "▶️ Autopost resumed."
+    )
+
+
+@admin_only
+async def delete_autopost(update, context):
+    if not context.args:
+        await update.effective_message.reply_text(
+            "/delete_autopost <autopost_id>"
+        )
+        return
+
+    sid = context.args[0]
+
+    try:
+        object_id = ObjectId(sid)
+    except Exception:
+        await update.effective_message.reply_text(
+            "❌ Invalid ID."
+        )
+        return
+
+    row = await autoposts_col.find_one({
+        "_id": object_id,
+    })
+
+    if not row:
+        await update.effective_message.reply_text(
+            "❌ Autopost not found."
+        )
+        return
+
+    deleted = failed = 0
+
+    for chat_id, message_id in row.get(
+        "last_messages",
+        {},
+    ).items():
+
+        if await delete_message_safe(
+            context.bot,
+            int(chat_id),
+            int(message_id),
+        ):
+            deleted += 1
+        else:
+            failed += 1
+
+    await autoposts_col.delete_one({
+        "_id": object_id,
+    })
+
+    await update.effective_message.reply_text(
+        "🗑️ AUTOPOST DELETED\n\n"
+        f"🆔 {sid}\n"
+        f"✅ Messages deleted: {deleted}\n"
+        f"❌ Failed: {failed}"
+    )
+
+
+@admin_only
+async def delete_all_autopost_messages(update, context):
+    rows = await autoposts_col.find({}).to_list(
+        length=1000
+    )
+
+    if not rows:
+        await update.effective_message.reply_text(
+            "ℹ️ No autoposts found."
+        )
+        return
+
+    total = deleted = failed = 0
+
+    for row in rows:
+        last_messages = row.get(
+            "last_messages",
+            {},
+        )
+
+        total += len(last_messages)
+
+        for chat_id, message_id in last_messages.items():
+            if await delete_message_safe(
+                context.bot,
+                int(chat_id),
+                int(message_id),
+            ):
+                deleted += 1
+            else:
+                failed += 1
+
+        await autoposts_col.update_one(
+            {"_id": row["_id"]},
+            {
+                "$set": {
+                    "last_messages": {},
+                    "updated_at": now(),
+                }
+            },
+        )
+
+    await update.effective_message.reply_text(
+        "🧹 ALL AUTOPOST MESSAGES PROCESSED\n\n"
+        f"📦 Tracked messages: {total}\n"
+        f"✅ Deleted: {deleted}\n"
+        f"❌ Failed: {failed}\n\n"
+        "💾 Autopost schedules are still saved."
+    )
+
+
+# ============================================================
+# CANCEL
+# ============================================================
+
 @admin_only
 async def cancel(update, context):
     context.user_data.pop("setup", None)
@@ -1413,10 +2327,28 @@ async def setup_router(update, context):
 
     if step == "content":
         await capture_content(update, context)
+
     elif step == "button":
         await capture_button(update, context)
+
     elif step == "interval":
         await capture_interval(update, context)
+
+    # ========================================================
+    # NEW AUTOPOST ROUTES
+    # ========================================================
+
+    elif step == "date":
+        await capture_autopost_date(update, context)
+
+    elif step == "start_time":
+        await capture_autopost_start_time(update, context)
+
+    elif step == "end_time":
+        await capture_autopost_end_time(update, context)
+
+    elif step == "autopost_interval":
+        await capture_autopost_interval(update, context)
 
 
 # ============================================================
@@ -1436,7 +2368,10 @@ async def error_handler(update, context):
 # ============================================================
 
 async def post_init(application):
-    global mongo, db, users_col, chats_col, schedules_col, sets_col
+    global mongo, db
+    global users_col, chats_col
+    global schedules_col, sets_col
+    global autoposts_col
 
     if not MONGO_URI:
         raise RuntimeError("MONGO_URI is missing.")
@@ -1449,15 +2384,49 @@ async def post_init(application):
     schedules_col = db["schedules"]
     sets_col = db["promo_sets"]
 
-    # IMPORTANT:
-    # Never create unique=True on _id.
-    # MongoDB already owns the _id_ unique index.
-    await users_col.create_index("user_id", unique=True)
-    await chats_col.create_index("chat_id", unique=True)
-    await schedules_col.create_index("enabled")
-    await sets_col.create_index("set_no", unique=True)
+    # NEW COLLECTION
+    autoposts_col = db["autoposts"]
 
+    await users_col.create_index(
+        "user_id",
+        unique=True,
+    )
+
+    await chats_col.create_index(
+        "chat_id",
+        unique=True,
+    )
+
+    await schedules_col.create_index(
+        "enabled"
+    )
+
+    await sets_col.create_index(
+        "set_no",
+        unique=True,
+    )
+
+    # NEW AUTOPOST INDEXES
+    await autoposts_col.create_index(
+        "enabled"
+    )
+
+    await autoposts_col.create_index(
+        "next_run_at"
+    )
+
+    await autoposts_col.create_index(
+        [
+            ("enabled", 1),
+            ("next_run_at", 1),
+        ]
+    )
+
+    # OLD SCHEDULES
     await restore_schedules(application)
+
+    # NEW AUTOPOST SCHEDULER
+    await restore_autopost_scheduler(application)
 
     log.info("Database initialized.")
 
@@ -1488,28 +2457,133 @@ def main():
         .build()
     )
 
-    # Commands
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("users", users))
-    application.add_handler(CommandHandler("chats", chats))
-    application.add_handler(CommandHandler("broadcast", broadcast))
-    application.add_handler(CommandHandler("ubroadcast", ubroadcast))
-    application.add_handler(CommandHandler("schedule", schedule))
-    application.add_handler(CommandHandler("schedules", schedules))
-    application.add_handler(CommandHandler("pause", pause))
-    application.add_handler(CommandHandler("resume", resume))
-    application.add_handler(CommandHandler("stopall", stop_all_schedules))
-    application.add_handler(CommandHandler("delete_schedule", delete_schedule))
-    application.add_handler(CommandHandler("deleteall", delete_all_schedule_messages))
-    application.add_handler(CommandHandler("cancel", cancel))
+    # ========================================================
+    # COMMANDS
+    # ========================================================
 
-    # Promotion sets
-    application.add_handler(CommandHandler("sets", sets_command))
-    application.add_handler(CommandHandler("setlinks", setlinks_command))
-    application.add_handler(CommandHandler("clearsets", clearsets_command))
+    application.add_handler(
+        CommandHandler("start", start)
+    )
 
-    # Admin panel
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    application.add_handler(
+        CommandHandler("users", users)
+    )
+
+    application.add_handler(
+        CommandHandler("chats", chats)
+    )
+
+    application.add_handler(
+        CommandHandler("broadcast", broadcast)
+    )
+
+    application.add_handler(
+        CommandHandler("ubroadcast", ubroadcast)
+    )
+
+    # OLD SCHEDULE — UNCHANGED
+    application.add_handler(
+        CommandHandler("schedule", schedule)
+    )
+
+    application.add_handler(
+        CommandHandler("schedules", schedules)
+    )
+
+    application.add_handler(
+        CommandHandler("pause", pause)
+    )
+
+    application.add_handler(
+        CommandHandler("resume", resume)
+    )
+
+    application.add_handler(
+        CommandHandler("stopall", stop_all_schedules)
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "delete_schedule",
+            delete_schedule,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "deleteall",
+            delete_all_schedule_messages,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler("cancel", cancel)
+    )
+
+    # ========================================================
+    # NEW AUTOPOST COMMANDS
+    # ========================================================
+
+    application.add_handler(
+        CommandHandler("autopost", autopost)
+    )
+
+    application.add_handler(
+        CommandHandler("autoposts", autoposts)
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "pause_autopost",
+            pause_autopost,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "resume_autopost",
+            resume_autopost,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "delete_autopost",
+            delete_autopost,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "deleteall_autopost",
+            delete_all_autopost_messages,
+        )
+    )
+
+    # ========================================================
+    # PROMOTION SETS
+    # ========================================================
+
+    application.add_handler(
+        CommandHandler("sets", sets_command)
+    )
+
+    application.add_handler(
+        CommandHandler("setlinks", setlinks_command)
+    )
+
+    application.add_handler(
+        CommandHandler("clearsets", clearsets_command)
+    )
+
+    # ========================================================
+    # ADMIN PANEL
+    # ========================================================
+
     application.add_handler(
         CallbackQueryHandler(
             admin_callback,
@@ -1517,13 +2591,17 @@ def main():
         )
     )
 
-    # Chat registration
+    # ========================================================
+    # CHAT REGISTRATION
+    # ========================================================
+
     application.add_handler(
         ChatMemberHandler(
             my_chat_member_update,
             ChatMemberHandler.MY_CHAT_MEMBER,
         )
     )
+
     application.add_handler(
         ChatMemberHandler(
             chat_member_update,
@@ -1531,7 +2609,10 @@ def main():
         )
     )
 
-    # Setup text/photo
+    # ========================================================
+    # SETUP TEXT / PHOTO
+    # ========================================================
+
     application.add_handler(
         MessageHandler(
             filters.PHOTO | (filters.TEXT & ~filters.COMMAND),
@@ -1539,9 +2620,13 @@ def main():
         )
     )
 
-    application.add_error_handler(error_handler)
+    application.add_error_handler(
+        error_handler
+    )
 
-    log.info("Starting promotion bot...")
+    log.info(
+        "Starting promotion bot..."
+    )
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
